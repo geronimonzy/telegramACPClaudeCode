@@ -10,7 +10,8 @@ A Linux-deployable service that lets the user talk to Claude Code running on the
 ## Decisions already made (with user)
 
 - **Stack:** TypeScript / Node ≥ 22, npm. Telegram via **grammY**; ACP via **`@agentclientprotocol/sdk`** (v1.x) driving the canonical adapter **`@agentclientprotocol/claude-agent-acp`**.
-- **Build fresh**, MIT-licensed. Existing bridges were evaluated (see `.frugal-fable/research/existing-bridges.md`) and rejected: best fit (OpenACP) is AGPL-3.0 with an unreachable repo; the Rust one auto-approves all permissions; the others miss forum topics or are stalling. Their behavior is prior art only — no code is copied.
+- **Build fresh**, MIT-licensed. Existing bridges were evaluated (see `.frugal-fable/research/existing-bridges.md`) and rejected: best fit (OpenACP) has contradictory license terms (AGPL in package.json vs MIT in README/site, no LICENSE file), a suspended GitHub org, and ~93 lines of tests for 49K LOC; the Rust one auto-approves all permissions; the others miss forum topics or are stalling.
+- **OpenACP as design reference (not code):** its full TS source was recovered from npm sourcemaps into `.frugal-fable/research/openacp-src/` (report: `openacp-deep.md`). We adopt four of its proven patterns as ideas, reimplemented cleanly: (1) an edit-in-place streaming draft class with throttle + overlapping-edit race handling; (2) generic mapping of ACP permission option `kind`s to inline keyboards; (3) stripping unrecognized `/` prefixes before forwarding prompts, to avoid adapter hangs; (4) shimming the legacy `session/set_mode` API behind `session/set_config_option`. No code is copied.
 - **Deployment:** systemd (user) service. Long polling, no webhook, no open ports.
 - **Conversations:** one Telegram **forum supergroup**; one topic = one ACP session = one dedicated `claude-agent-acp` subprocess (crash isolation, trivial cleanup).
 - **Permissions:** inline buttons by default; per-topic mode switching (`/mode`, `/yolo`).
