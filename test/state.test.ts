@@ -73,4 +73,29 @@ describe("StateStore", () => {
     const store = new StateStore(path);
     await expect(store.load()).rejects.toThrow(path);
   });
+
+  it("serializes concurrent upserts without rejection and persists all entries", async () => {
+    const path = tmpPath();
+    const store = new StateStore(path);
+    await store.load();
+
+    const sessions: SessionState[] = Array.from({ length: 10 }, (_, i) => ({
+      threadId: i,
+      acpSessionId: `acp-${i}`,
+      cwd: `/tmp/proj${i}`,
+      title: `Session ${i}`,
+      createdAt: "2026-07-03T00:00:00.000Z",
+    }));
+
+    await expect(
+      Promise.all(sessions.map((s) => store.upsert(s))),
+    ).resolves.not.toThrow();
+
+    const reloaded = new StateStore(path);
+    await reloaded.load();
+    expect(reloaded.list()).toHaveLength(10);
+    for (const s of sessions) {
+      expect(reloaded.get(s.threadId)).toEqual(s);
+    }
+  });
 });

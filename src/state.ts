@@ -1,5 +1,6 @@
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
 
 export interface SessionState {
   threadId: number; // Telegram message_thread_id
@@ -12,6 +13,12 @@ export interface SessionState {
 export class StateStore {
   private readonly filePath: string;
   private sessions = new Map<number, SessionState>();
+  // Chain that serializes all persist() calls so concurrent upsert/remove
+  // calls never race on the temp-file write/rename. Kept always-resolved
+  // (errors are caught and swallowed here) so one failed persist doesn't
+  // permanently wedge the queue for subsequent calls; the error is still
+  // propagated to the caller that triggered it via the returned promise.
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -62,8 +69,21 @@ export class StateStore {
   }
 
   private async persist(): Promise<void> {
+    // Link this call onto the shared queue so writes never overlap. The
+    // queue itself must never reject (or every later call would inherit a
+    // rejected promise and immediately fail), so failures are swallowed
+    // inside the chain and re-thrown only to this call's own awaiter.
+    const result = this.writeQueue.then(() => this.doPersist());
+    this.writeQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    await result;
+  }
+
+  private async doPersist(): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true });
-    const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    const tmpPath = `${this.filePath}.${randomUUID()}.tmp`;
     await writeFile(tmpPath, JSON.stringify(this.list(), null, 2), "utf-8");
     await rename(tmpPath, this.filePath);
   }
