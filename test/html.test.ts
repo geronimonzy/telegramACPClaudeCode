@@ -73,8 +73,47 @@ describe("mdToTelegramHtml", () => {
     expect(mdToTelegramHtml("## Title")).toBe("<b>Title</b>");
   });
 
+  it("does not double-wrap a heading whose body is already bold", () => {
+    expect(mdToTelegramHtml("## **Title** with `code`")).toBe(
+      "<b>Title with <code>code</code></b>",
+    );
+  });
+
   it("never emits unbalanced or nested-invalid tags for pathological input", () => {
     const html = mdToTelegramHtml("**a`u`b**");
+    expect(isBalanced(html)).toBe(true);
+  });
+
+  it("escapes a quote in a link href instead of breaking out of the attribute", () => {
+    const html = mdToTelegramHtml('[text](https://example.com/"onmouseover="x)');
+    expect(html).toContain("&quot;");
+    expect(isBalanced(html)).toBe(true);
+  });
+
+  // Documented v1 limitation: bold markers that span an inline code run
+  // (e.g. **bold `code` text**) are not recognized as bold, because the
+  // bold and code regexes are applied to disjoint, already-split token
+  // ranges (see splitInlineCode / renderInlineFormatting). The markers
+  // fall through as literal, escaped asterisks — safe, just unstyled.
+  it("leaves bold markers spanning inline code as literal, unstyled asterisks (v1 limitation)", () => {
+    const html = mdToTelegramHtml("**bold `code` text**");
+    expect(html).toContain("**bold ");
+    expect(html).toContain(" text**");
+    expect(html).not.toContain("<b>");
+    expect(isBalanced(html)).toBe(true);
+  });
+
+  it("renders a fenced code block with a C++-style language tag", () => {
+    const md = "```c++\nint x = 1;\n```";
+    expect(mdToTelegramHtml(md)).toBe(
+      '<pre><code class="language-c++">int x = 1;</code></pre>',
+    );
+  });
+
+  it("tolerates CRLF line endings around a fence", () => {
+    const md = "```ts\r\nconst x = 1;\r\n```";
+    const html = mdToTelegramHtml(md);
+    expect(html).toContain('<pre><code class="language-ts">');
     expect(isBalanced(html)).toBe(true);
   });
 });
@@ -94,5 +133,9 @@ describe("fenceState", () => {
 
   it("returns null when there is no fence at all", () => {
     expect(fenceState("just text")).toBeNull();
+  });
+
+  it("returns a C++-style language tag containing a non-word character", () => {
+    expect(fenceState("```c++\nx")).toBe("c++");
   });
 });

@@ -13,11 +13,23 @@
 // re-parsed. That's what makes "no unbalanced/nested tags" structurally
 // true instead of merely tested-for.
 
-const FENCE_RE = /^```(\w*)$/;
+// Language tag may contain any non-whitespace, non-backtick characters (so
+// e.g. ```c++ works); an optional trailing \r tolerates CRLF-terminated input.
+const FENCE_RE = /^```([^\s`]*)\r?$/;
 
 /** Escapes the only three characters Telegram's HTML mode requires escaped. */
 export function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Escapes a value for use inside a double-quoted HTML attribute (e.g. `href`).
+ * escapeHtml alone is not enough here: a literal `"` in a URL would close the
+ * attribute early and produce malformed HTML, which Telegram's sendMessage
+ * API rejects outright.
+ */
+function escapeAttr(s: string): string {
+  return escapeHtml(s).replace(/"/g, "&quot;");
 }
 
 /**
@@ -68,7 +80,7 @@ function renderInlineFormatting(text: string): string {
   while ((m = re.exec(text))) {
     out += escapeHtml(text.slice(last, m.index));
     if (m[1] !== undefined) {
-      out += `<a href="${escapeHtml(m[2])}">${escapeHtml(m[1])}</a>`;
+      out += `<a href="${escapeAttr(m[2])}">${escapeHtml(m[1])}</a>`;
     } else if (m[3] !== undefined) {
       out += `<b>${escapeHtml(m[3])}</b>`;
     } else if (m[4] !== undefined) {
@@ -82,12 +94,44 @@ function renderInlineFormatting(text: string): string {
   return out;
 }
 
+/**
+ * Same construct detection as renderInlineFormatting, but for heading bodies:
+ * bold/italic markers are stripped rather than re-wrapped, since the whole
+ * heading is already wrapped in a single outer <b>...</b> (renderLine below)
+ * and Telegram doesn't allow nesting <b> inside <b>. Links still render as
+ * <a> since they aren't redundant with the heading's own styling.
+ */
+function renderHeadingText(text: string): string {
+  const re = new RegExp(INLINE_RE);
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    out += escapeHtml(text.slice(last, m.index));
+    if (m[1] !== undefined) {
+      out += `<a href="${escapeAttr(m[2])}">${escapeHtml(m[1])}</a>`;
+    } else if (m[3] !== undefined) {
+      out += escapeHtml(m[3]);
+    } else if (m[4] !== undefined) {
+      out += escapeHtml(m[4]);
+    } else {
+      out += escapeHtml(m[5]);
+    }
+    last = re.lastIndex;
+  }
+  out += escapeHtml(text.slice(last));
+  return out;
+}
+
 /** Renders one non-fence line: inline code spans first, then bold/italic/link on the rest. */
 function renderLine(line: string): string {
   const heading = /^(#{1,6})\s+(.*)$/.exec(line);
   const body = heading ? heading[2] : line;
   const rendered = splitInlineCode(body)
-    .map((tok) => (tok.code ? `<code>${escapeHtml(tok.value)}</code>` : renderInlineFormatting(tok.value)))
+    .map((tok) => {
+      if (tok.code) return `<code>${escapeHtml(tok.value)}</code>`;
+      return heading ? renderHeadingText(tok.value) : renderInlineFormatting(tok.value);
+    })
     .join("");
   return heading ? `<b>${rendered}</b>` : rendered;
 }
@@ -112,7 +156,7 @@ export function mdToTelegramHtml(md: string): string {
         i++;
       }
       if (i < lines.length) i++; // consume closing fence line, if present
-      const classAttr = lang ? ` class="language-${escapeHtml(lang)}"` : "";
+      const classAttr = lang ? ` class="language-${escapeAttr(lang)}"` : "";
       out.push(`<pre><code${classAttr}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
     } else {
       out.push(renderLine(lines[i]));
