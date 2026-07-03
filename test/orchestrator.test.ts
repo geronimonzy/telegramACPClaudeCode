@@ -5,6 +5,7 @@ import { AgentSession } from "../src/acp/agent-session.js";
 import { PermissionBroker, type PermissionPrompt } from "../src/telegram/permissions.js";
 import { FakeApi } from "./helpers/fake-api.js";
 import { TopicSession, type TopicUi } from "../src/orchestrator.js";
+import type { InlineKeyboard } from "../src/bridge.js";
 
 const CFG = { editIntervalMs: 5, typingIntervalMs: 5, showThoughts: true };
 
@@ -13,6 +14,7 @@ class FakeUi implements TopicUi {
   apis: FakeApi[] = [];
   typingCount = 0;
   notifications: string[] = [];
+  notifyKeyboards: Array<InlineKeyboard | undefined> = [];
   permissionPrompts: PermissionPrompt[] = [];
   editedPermissions: Array<[number, string]> = [];
   /** When true, every `typing()` call throws instead of recording. */
@@ -28,8 +30,9 @@ class FakeUi implements TopicUi {
     this.typingCount++;
     if (this.typingThrows) throw new Error("typing boom");
   }
-  async notify(html: string): Promise<void> {
+  async notify(html: string, keyboard?: InlineKeyboard): Promise<void> {
     this.notifications.push(html);
+    this.notifyKeyboards.push(keyboard);
   }
   async presentPermission(p: PermissionPrompt): Promise<number> {
     this.permissionPrompts.push(p);
@@ -200,11 +203,16 @@ describe("TopicSession", () => {
     expect(ui.notifications.some((n) => /refusal/i.test(n))).toBe(true);
   });
 
-  it("handleAgentExit notifies that the agent process died", async () => {
+  it("handleAgentExit notifies that the agent process died and offers a Restart button", async () => {
     const { topic, ui } = await makeTopic([]);
     topic.handleAgentExit({ code: 1 });
     await vi.waitFor(() => expect(ui.notifications.length).toBeGreaterThanOrEqual(1));
-    expect(ui.notifications.some((n) => /died/i.test(n))).toBe(true);
+    const i = ui.notifications.findIndex((n) => /died/i.test(n));
+    expect(i).toBeGreaterThanOrEqual(0);
+    // The death notice carries the restart keyboard targeting this topic (thread 42).
+    const kb = ui.notifyKeyboards[i];
+    expect(kb?.inline_keyboard[0]?.[0]?.callback_data).toBe("restart:42");
+    expect(kb?.inline_keyboard[0]?.[0]?.text).toContain("Restart");
   });
 
   it("caches usage updates for /status", async () => {

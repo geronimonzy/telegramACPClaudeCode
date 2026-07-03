@@ -132,6 +132,32 @@ describe("TerminalRegistry", () => {
     ).rejects.toBeInstanceOf(acp.RequestError);
   });
 
+  it("releaseForSession kills and removes only the named session's terminals", async () => {
+    registry = new TerminalRegistry();
+    const handlers = registry.handlers();
+
+    const a = await handlers.createTerminal!({
+      sessionId: "A",
+      command: "sh",
+      args: ["-c", "sleep 30"],
+    });
+    const b = await handlers.createTerminal!({
+      sessionId: "B",
+      command: "sh",
+      args: ["-c", "sleep 30"],
+    });
+
+    registry.releaseForSession("A");
+
+    // A's terminal is killed and its id invalidated…
+    await expect(
+      handlers.terminalOutput!({ sessionId: "A", terminalId: a.terminalId }),
+    ).rejects.toBeInstanceOf(acp.RequestError);
+    // …while B's is untouched and still running/queryable.
+    const bOut = await handlers.terminalOutput!({ sessionId: "B", terminalId: b.terminalId });
+    expect(bOut.exitStatus).toBeNull();
+  });
+
   it("disposeAll kills every live child", async () => {
     registry = new TerminalRegistry();
     const handlers = registry.handlers();

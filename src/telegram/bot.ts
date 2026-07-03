@@ -136,7 +136,13 @@ export async function runBot(cfg: Config): Promise<void> {
   // SECURITY FIRST: allowlist + forum-chat guard run before any routing, for
   // messages AND callback queries. Non-matching updates are ignored silently.
   bot.use(async (ctx: Context, next) => {
-    if (!isAllowedUpdate(cfg, ctx.from, ctx.chat?.id)) return;
+    if (!isAllowedUpdate(cfg, ctx.from, ctx.chat?.id)) {
+      log.debug(
+        { chatId: ctx.chat?.id, fromId: ctx.from?.id },
+        "update rejected by allowlist/chat guard",
+      );
+      return;
+    }
     await next();
   });
 

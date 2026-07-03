@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as acp from "@agentclientprotocol/sdk";
 
 interface TerminalEntry {
+  sessionId: string;
   child: ChildProcess;
   output: string;
   outputByteLimit?: number;
@@ -45,6 +46,22 @@ export class TerminalRegistry {
     }
   }
 
+  /**
+   * Release every terminal belonging to one ACP session: kill any still-running
+   * child and drop the entry (like {@link releaseTerminal}, but for all of a
+   * session's terminals at once). Called on `/end` and restart so a session's
+   * terminals don't leak until process shutdown.
+   */
+  releaseForSession(sessionId: string): void {
+    for (const [terminalId, entry] of this.#terminals) {
+      if (entry.sessionId !== sessionId) continue;
+      if (entry.exitStatus === undefined) {
+        killEntry(entry);
+      }
+      this.#terminals.delete(terminalId);
+    }
+  }
+
   async #createTerminal(
     params: acp.CreateTerminalRequest,
   ): Promise<acp.CreateTerminalResponse> {
@@ -65,8 +82,11 @@ export class TerminalRegistry {
 
     const terminalId = `term-${this.#nextId++}`;
     const entry: TerminalEntry = {
+      sessionId: params.sessionId,
       child,
       output: "",
+      // The captured buffer is deliberately uncapped when outputByteLimit is
+      // absent: byte-limiting is an opt-in per the ACP protocol.
       outputByteLimit: params.outputByteLimit ?? undefined,
       truncated: false,
       exited: undefined as unknown as Promise<acp.TerminalExitStatus>,

@@ -5,3 +5,4 @@ dist/
 .superpowers/
 data/
 config.json
+.env

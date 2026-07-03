@@ -191,6 +191,9 @@ export class MockAgent implements acp.Agent {
 export function wireMockAgent(script: TurnScript[] = []): {
   agent: MockAgent;
   clientStream: acp.Stream;
+  /** The agent side of the transport; closing its writable ends the client's
+   * connection (simulating the agent process dying). */
+  agentStream: acp.Stream;
 } {
   const [agentStream, clientStream] = streamPair();
   let agent!: MockAgent;
@@ -200,5 +203,5 @@ export function wireMockAgent(script: TurnScript[] = []): {
     agent.script = script;
     return agent;
   }, agentStream);
-  return { agent, clientStream };
+  return { agent, clientStream, agentStream };
 }

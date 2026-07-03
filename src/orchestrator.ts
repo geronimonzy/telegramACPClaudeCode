@@ -24,6 +24,7 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 import type { AgentSession } from "./acp/agent-session.js";
+import type { InlineKeyboard } from "./bridge.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
 import { log } from "./log.js";
@@ -43,8 +44,8 @@ export interface TopicUi {
   messageApi(): MessageApi;
   /** Emit one `sendChatAction("typing")` for this topic. */
   typing(): void;
-  /** Send a one-off message (errors, stop reasons, queue-full notices). */
-  notify(html: string): Promise<void>;
+  /** Send a one-off message (errors, stop reasons, queue-full notices), optionally with an inline keyboard. */
+  notify(html: string, keyboard?: InlineKeyboard): Promise<void>;
   /** Present a permission prompt; resolves with the sent message id. */
   presentPermission(p: PermissionPrompt): Promise<number>;
   /** Edit a previously-sent permission message (e.g. to show the decision). */
@@ -239,8 +240,11 @@ export class TopicSession {
   /** The agent process died: surface it. Also suppresses the turn-error notice. */
   handleAgentExit(_info: { code: number | null }): void {
     this.#agentExited = true;
+    const keyboard: InlineKeyboard = {
+      inline_keyboard: [[{ text: "🔄 Restart", callback_data: `restart:${this.#threadId}` }]],
+    };
     void this.#ui
-      .notify("💥 agent process died — /new to restart or tap Restart")
+      .notify("💥 agent process died — /new to restart or tap Restart", keyboard)
       .catch((e) => logError("agent-exit notify failed", e));
   }
 

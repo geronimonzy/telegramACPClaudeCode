@@ -11,7 +11,7 @@
 // every message send carries a message_thread_id (via BotApi, whose adapter
 // threads it through). All logic lives here — bot.ts is a thin adapter.
 
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
@@ -76,7 +76,7 @@ export interface IncomingMsg {
 /** The six forum-topic icon colors Telegram permits, cycled by `/new`. */
 const ICON_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
 
-const MAX_PHOTO_BYTES = 20 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_MSG_LIMIT = 4000;
 
@@ -199,7 +199,8 @@ export class Bridge {
         await this.#store.remove(s.threadId);
         await this.#send(
           s.threadId,
-          `💥 <b>${escapeHtml(s.title)}</b> — could not restart the agent. Use /new to start again.`,
+          `💥 <b>${escapeHtml(s.title)}</b> — could not restart the agent. Use /new to start again or tap Restart.`,
+          this.#restartKeyboard(s.threadId),
         );
       }
     }
@@ -213,14 +214,12 @@ export class Bridge {
    */
   async newTopic(
     name: string | undefined,
-    cwdArg: string | undefined,
     reply: (html: string) => Promise<void>,
   ): Promise<void> {
     const n = ++this.#seq;
     const title = name && name.length > 0 ? name : `claude-${n}`;
     const iconColor = ICON_COLORS[(n - 1) % ICON_COLORS.length]!;
-    const cwd =
-      cwdArg ?? (name ? this.#cfg.projects[name] : undefined) ?? this.#cfg.defaultCwd;
+    const cwd = (name ? this.#cfg.projects[name] : undefined) ?? this.#cfg.defaultCwd;
 
     let threadId: number;
     try {
@@ -248,13 +247,25 @@ export class Bridge {
       title,
       createdAt: new Date().toISOString(),
     });
-    await this.#send(
-      threadId,
-      `🆕 <b>${escapeHtml(title)}</b>\n` +
-        `cwd: <code>${escapeHtml(cwd)}</code>\n` +
-        `mode: ${escapeHtml(agent.currentModeId ?? "default")}\n` +
-        `/commands for the commands this agent supports`,
-    );
+    let introId: number | undefined;
+    try {
+      introId = await this.#botApi.sendMessage(
+        threadId,
+        `🆕 <b>${escapeHtml(title)}</b>\n` +
+          `cwd: <code>${escapeHtml(cwd)}</code>\n` +
+          `mode: ${escapeHtml(agent.currentModeId ?? "default")}\n` +
+          `/commands for the commands this agent supports`,
+      );
+    } catch (e) {
+      logError("send failed", e);
+    }
+    // Pin the intro so the session's key context stays reachable; a missing
+    // can_pin_messages right (or any pin failure) must not fail /new.
+    if (introId !== undefined) {
+      await this.#botApi
+        .pinChatMessage(threadId, introId)
+        .catch((e) => logError("pinChatMessage failed", e));
+    }
     await reply(`🆕 Created <b>${escapeHtml(title)}</b>.`);
   }
 
@@ -273,7 +284,7 @@ export class Bridge {
 
     // `/new` works from any topic (creates a *new* one).
     if (cmd?.cmd === "new") {
-      await this.newTopic(cmd.args || undefined, undefined, (h) => this.#send(threadId, h));
+      await this.newTopic(cmd.args || undefined, (h) => this.#send(threadId, h));
       return;
     }
 
@@ -383,6 +394,7 @@ export class Bridge {
 
   async #endTopic(threadId: number, session: TopicSession): Promise<void> {
     this.#sessions.delete(threadId);
+    this.#terminals.releaseForSession(session.agentSession.sessionId);
     try {
       await session.dispose();
       await session.agentSession.dispose();
@@ -390,6 +402,11 @@ export class Bridge {
       logError("end dispose failed", e);
     }
     await this.#store.remove(threadId);
+    // Best-effort cleanup of this topic's saved uploads; failure must not fail /end.
+    await rm(path.join(this.#cfg.dataDir, "uploads", String(threadId)), {
+      recursive: true,
+      force: true,
+    }).catch((e) => logError("uploads cleanup failed", e));
     await this.#botApi.closeForumTopic(threadId).catch((e) => logError("closeForumTopic", e));
   }
 
@@ -506,7 +523,7 @@ export class Bridge {
     if (msg.photo) {
       const file = await this.#botApi.getFile(msg.photo.fileId);
       const size = file.fileSize ?? msg.photo.fileSize ?? 0;
-      if (size > MAX_PHOTO_BYTES) {
+      if (size > MAX_UPLOAD_BYTES) {
         await this.#send(threadId, "⚠️ photo is larger than 20 MB — skipped.");
       } else if (file.filePath) {
         const buf = await this.#botApi.downloadFile(file.filePath);
@@ -524,7 +541,7 @@ export class Bridge {
       // Check the size Telegram already told us BEFORE calling getFile, so an
       // oversized upload is refused without an extra round trip (mirrors the
       // cap photos are held to).
-      if ((msg.document.fileSize ?? 0) > MAX_PHOTO_BYTES) {
+      if ((msg.document.fileSize ?? 0) > MAX_UPLOAD_BYTES) {
         await this.#send(threadId, "⚠️ file is larger than 20 MB — skipped.");
         return blocks;
       }
@@ -613,12 +630,15 @@ export class Bridge {
     const existing = this.#sessions.get(threadId);
     if (existing) {
       this.#sessions.delete(threadId);
+      this.#terminals.releaseForSession(existing.agentSession.sessionId);
       try {
         await existing.dispose();
         await existing.agentSession.dispose();
       } catch (e) {
         logError("restart dispose failed", e);
       }
+    } else {
+      this.#terminals.releaseForSession(stored.acpSessionId);
     }
 
     try {
@@ -639,13 +659,17 @@ export class Bridge {
   async #handleGeneral(msg: IncomingMsg): Promise<void> {
     const cmd = msg.text ? parseCommand(msg.text) : undefined;
     if (cmd?.cmd === "new") {
-      await this.newTopic(cmd.args || undefined, undefined, (h) => this.#send(undefined, h));
+      await this.newTopic(cmd.args || undefined, (h) => this.#send(undefined, h));
       return;
     }
     await this.#send(
       undefined,
       "This is the General topic. Use /new [name] to start a session; per-session commands run inside a session's own topic.",
     );
+  }
+
+  #restartKeyboard(threadId: number): InlineKeyboard {
+    return { inline_keyboard: [[{ text: "🔄 Restart", callback_data: `restart:${threadId}` }]] };
   }
 
   #modeKeyboard(threadId: number, agent: AgentSession): InlineKeyboard {
@@ -697,8 +721,8 @@ export class Bridge {
       typing(): void {
         void botApi.sendChatAction(threadId, "typing").catch((e) => logError("typing", e));
       },
-      async notify(html: string): Promise<void> {
-        await botApi.sendMessage(threadId, html);
+      async notify(html: string, keyboard?: InlineKeyboard): Promise<void> {
+        await botApi.sendMessage(threadId, html, keyboard);
       },
       async presentPermission(p): Promise<number> {
         return botApi.sendMessage(threadId, p.html, { inline_keyboard: p.keyboard });
