@@ -37,6 +37,10 @@ const KIND_EMOJI: Record<acp.ToolKind, string> = {
 };
 
 const DIFF_MAX_LEN = 600;
+// Tool titles come from the agent and are unbounded; an uncapped title can
+// singlehandedly blow the fit budget and force truncateHtmlSafe onto the whole
+// panel. Cap it well under any budget — no legitimate title needs more.
+const TITLE_MAX_LEN = 300;
 
 interface Row {
   toolCallId: string;
@@ -51,9 +55,14 @@ function truncateDiff(text: string): string {
   return text.slice(0, DIFF_MAX_LEN) + "…";
 }
 
+function truncateTitle(text: string): string {
+  if (text.length <= TITLE_MAX_LEN) return text;
+  return text.slice(0, TITLE_MAX_LEN) + "…";
+}
+
 /** Render one tool-call row as a self-contained Rich `<li>` (diff → `<pre><code>`). */
 function renderRow(row: Row): string {
-  let inner = `${STATUS_EMOJI[row.status]} ${KIND_EMOJI[row.kind]} <b>${escapeRich(row.title)}</b>`;
+  let inner = `${STATUS_EMOJI[row.status]} ${KIND_EMOJI[row.kind]} <b>${escapeRich(truncateTitle(row.title))}</b>`;
   for (const item of row.content) {
     if (item.type === "diff") {
       inner += `<pre><code>${escapeRich(truncateDiff(item.newText))}</code></pre>`;

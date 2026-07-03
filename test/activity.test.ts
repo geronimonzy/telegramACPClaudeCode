@@ -174,6 +174,25 @@ describe("ActivityRenderer (Rich)", () => {
     expect(html).toContain("✅");
   });
 
+  // Regression (T17 review, Critical): tool titles come from the agent and were
+  // uncapped — a pathological title alone could blow the whole panel past the
+  // rich budget and force lossy whole-payload truncation. Titles are capped at
+  // the source so the panel stays comfortably within budget.
+  it("caps a pathological tool title; the panel stays balanced and within budget", async () => {
+    const api = new FakeApi();
+    const live = new LiveMessage(api, INTERVAL);
+    const r = new ActivityRenderer(live);
+    r.onToolCall(
+      toolCall({ toolCallId: "big", title: "T".repeat(40000), kind: "read", status: "in_progress" }),
+    );
+    await live.flushNow();
+    const html = latest(api);
+    expect(html.length).toBeLessThan(1000); // capped title, not 40k
+    expect(html).toContain("…"); // cap indicator
+    expect(html.endsWith("</details>")).toBe(true); // wrappers intact
+    expect(isBalanced(html)).toBe(true);
+  });
+
   it("the running counter reflects multiple concurrent calls", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);

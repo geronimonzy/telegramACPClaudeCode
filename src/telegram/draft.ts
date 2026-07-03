@@ -204,7 +204,7 @@ export class MessageDraft {
   ) {
     this.maxLen = opts.maxLen ?? DEFAULT_MAX_LEN;
     this.render = opts.render ?? mdToTelegramHtml;
-    this.t = new Throttle(api, opts.intervalMs, (t) => this.flushStep(t));
+    this.t = new Throttle(api, opts.intervalMs, (t) => this.flushStep(t), this.maxLen);
   }
 
   append(mdText: string): void {

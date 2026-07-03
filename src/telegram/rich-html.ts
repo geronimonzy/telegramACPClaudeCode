@@ -112,12 +112,40 @@ function isBlockStart(line: string): boolean {
   );
 }
 
-/** Split a `| a | b |` row into trimmed cell strings (outer pipes stripped). */
+/**
+ * Split a `| a | b |` row into trimmed cell strings (outer pipes stripped).
+ * A `|` inside an inline code span (`` `x|y` ``) is cell CONTENT, not a
+ * boundary, and `\|` is GFM's escaped literal pipe — both are honored here so
+ * agent-emitted tables with piped code don't gain phantom columns.
+ */
 function splitCells(line: string): string[] {
   let t = line.trim();
   if (t.startsWith("|")) t = t.slice(1);
   if (t.endsWith("|")) t = t.slice(0, -1);
-  return t.split("|").map((c) => c.trim());
+  const cells: string[] = [];
+  let cur = "";
+  let inCode = false;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (ch === "\\" && t[i + 1] === "|") {
+      cur += "|";
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      inCode = !inCode;
+      cur += ch;
+      continue;
+    }
+    if (ch === "|" && !inCode) {
+      cells.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
 }
 
 /**
@@ -184,7 +212,12 @@ export function mdToRichHtml(md: string): string {
       let table = "<table>";
       table += `<tr>${header.map((c) => `<th>${renderInline(c)}</th>`).join("")}</tr>`;
       for (const r of rows) {
-        table += `<tr>${splitCells(r).map((c) => `<td>${renderInline(c)}</td>`).join("")}</tr>`;
+        // Normalize every body row to the header's width (GFM behavior):
+        // missing cells are padded empty, extras are dropped — a ragged row
+        // must not shift the whole column grid.
+        const cells = splitCells(r).slice(0, header.length);
+        while (cells.length < header.length) cells.push("");
+        table += `<tr>${cells.map((c) => `<td>${renderInline(c)}</td>`).join("")}</tr>`;
       }
       table += "</table>";
       out.push(table);

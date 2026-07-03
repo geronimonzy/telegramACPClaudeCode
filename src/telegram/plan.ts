@@ -17,10 +17,18 @@ const STATUS_EMOJI: Record<acp.PlanEntryStatus, string> = {
   completed: "☑",
 };
 
+// Plan entry text comes from the agent and is unbounded; cap it so a single
+// pathological entry can't blow the fit budget (mirrors activity.ts's title cap).
+const ENTRY_MAX_LEN = 500;
+
 /** Render one plan entry as a self-contained Rich `<li>`. */
 function renderEntry(entry: acp.PlanEntry): string {
   const suffix = entry.priority === "high" ? " ‼️" : "";
-  return `<li>${STATUS_EMOJI[entry.status]} ${escapeRich(entry.content)}${suffix}</li>`;
+  const content =
+    entry.content.length <= ENTRY_MAX_LEN
+      ? entry.content
+      : entry.content.slice(0, ENTRY_MAX_LEN) + "…";
+  return `<li>${STATUS_EMOJI[entry.status]} ${escapeRich(content)}${suffix}</li>`;
 }
 
 export class PlanRenderer {

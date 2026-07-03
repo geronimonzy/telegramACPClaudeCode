@@ -194,6 +194,68 @@ describe("LiveMessage", () => {
     expect(sent).toContain("edit foo 59"); // newest row survives
   });
 
+  // Regression (T17 review, Critical): fitDetailsList joins rows with "" so a
+  // rich Activity/Plan payload is ONE logical line. When a pathological row
+  // pushed it over the rich budget, truncateHtmlSafe's tag stack knew only the
+  // inline tags — it closed the <b> but stranded <details>/<ul>/<li> open →
+  // guaranteed Telegram 400. The structural tags must be re-closed too.
+  it("truncates a rich <details><ul><li> single-blob payload keeping structural tags balanced", async () => {
+    const RICH = 31000;
+    const api = new FakeApi();
+    const lm = new LiveMessage(api, INTERVAL, RICH);
+    const content =
+      `<details open><summary>⚙️ Activity — 1 call · 1 running</summary>` +
+      `<ul><li>🔄 🔧 <b>${"T".repeat(40000)}</b></li></ul></details>`;
+    expect(content.length).toBeGreaterThan(RICH);
+    lm.set(content);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(api.sends).toHaveLength(1);
+    const sent = api.sends[0];
+    expect(sent.length).toBeLessThanOrEqual(RICH);
+    expect(isBalanced(sent)).toBe(true); // Telegram would reject otherwise
+    // The structural wrappers specifically are re-closed (the old bug's gap).
+    for (const t of ["details", "ul", "li", "b"]) {
+      const opens = (sent.match(new RegExp(`<${t}[ >]`, "g")) ?? []).length;
+      const closes = (sent.match(new RegExp(`</${t}>`, "g")) ?? []).length;
+      expect(closes, `unclosed <${t}>`).toBe(opens);
+    }
+  });
+
+  it("truncateHtmlSafe never cuts inside an &…; entity", () => {
+    // Position entities so the budget lands mid-`&lt;` without the guard.
+    const line = `<b>${"&lt;".repeat(100)}</b>`;
+    for (const max of [20, 21, 22, 23, 24]) {
+      const out = truncateHtmlSafe(line, max);
+      expect(out.length).toBeLessThanOrEqual(max);
+      // No dangling partial entity anywhere before the closers/ellipsis.
+      expect(out).not.toMatch(/&[a-zA-Z]{0,2}</);
+      expect(isBalanced(out)).toBe(true);
+    }
+  });
+
+  // Regression (T17 review, Major): the 400-fallback re-sends escapeHtml(raw),
+  // which is LONGER than the original (`<` → `&lt;`); un-clamped it could
+  // exceed the budget, 400 again, and silently freeze the panel.
+  it("the 400-fallback payload is clamped to the surface budget", async () => {
+    const MAX = 200;
+    const api = new FakeApi();
+    const lm = new LiveMessage(api, INTERVAL, MAX);
+    // 34 tags = 187 chars: under MAX un-escaped, way over once escaped.
+    const content = "<b>x</b>".repeat(23) + "<i>";
+    expect(content.length).toBeLessThanOrEqual(MAX);
+    api.failOnce(content, 400);
+    lm.set(content);
+    await vi.advanceTimersByTimeAsync(INTERVAL);
+
+    expect(api.sends).toHaveLength(2); // original + fallback
+    const fallback = api.sends[1];
+    expect(fallback.length).toBeLessThanOrEqual(MAX);
+    expect(fallback.endsWith("…")).toBe(true);
+    // The cut never leaves a truncated entity at the end.
+    expect(fallback).not.toMatch(/&[a-zA-Z]{0,5}…$/);
+  });
+
   it("a single <pre> diff row alone exceeding the budget is closed safely by truncateHtmlSafe", async () => {
     const api = new FakeApi();
     const lm = new LiveMessage(api, INTERVAL);

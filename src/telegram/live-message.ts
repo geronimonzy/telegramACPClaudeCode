@@ -41,6 +41,23 @@ function logDrop(context: string, e: unknown): void {
 }
 
 /**
+ * Clamp already-escaped (tag-free) text to `max` chars without leaving a
+ * truncated `&…;` entity or a lone high surrogate at the cut. Used only for
+ * the 400-fallback payload, which is `escapeHtml(raw)` and thus contains no
+ * markup to balance.
+ */
+function clampEscaped(s: string, max: number): string {
+  if (s.length <= max) return s;
+  let t = s.slice(0, max - 1); // reserve room for the ellipsis
+  // A cut inside `&amp;` etc. leaves `&am` — strip the partial entity.
+  t = t.replace(/&[a-zA-Z]{0,5}$/, "");
+  // Never end on an unpaired high surrogate.
+  const last = t.charCodeAt(t.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) t = t.slice(0, -1);
+  return t + "…";
+}
+
+/**
  * Serializes send/edit delivery for one logical Telegram message stream.
  *
  * Timing model: leading-edge + trailing debounce. The first change after an
@@ -67,6 +84,8 @@ export class Throttle {
     private readonly api: MessageApi,
     private readonly intervalMs: number,
     private readonly flushFn: (t: Throttle) => Promise<void>,
+    /** Budget the 400-fallback is clamped to (the surface's message limit). */
+    private readonly maxLen: number = LIVE_MAX_LEN,
   ) {}
 
   /** Signal that content changed; delivers now if idle, else schedules trailing. */
@@ -149,7 +168,12 @@ export class Throttle {
         logDrop("message", e); // invariant (3): drop, keep buffering
         return;
       }
-      const safe = escapeHtml(rawFallback);
+      // The escaped fallback can be LONGER than what just 400'd (escaping
+      // expands `<`/`>`/`&`), so clamp it to the surface's budget — an
+      // over-limit fallback would itself 400 and the message would silently
+      // freeze. Escaped text has no tags, so a plain cut is safe as long as
+      // it doesn't land inside an `&…;` entity or split a surrogate pair.
+      const safe = clampEscaped(escapeHtml(rawFallback), this.maxLen);
       try {
         await this.deliver(safe);
         this.lastDelivered = safe;
@@ -172,10 +196,19 @@ export class Throttle {
 /** Default budget for a plain-HTML live message (classic Telegram 4096 limit). */
 const LIVE_MAX_LEN = 4000;
 
-// The only tags the line-based renderers (activity.ts / plan.ts / permission
-// prompts) ever emit. `truncateHtmlSafe` tracks these so a mid-line char cut
-// can re-close whatever was left open.
-const OPENABLE_TAGS = new Set(["b", "i", "u", "s", "code", "pre", "a", "blockquote"]);
+// Every openable tag a LiveMessage payload can contain: the classic inline set
+// the line-based renderers emit, PLUS the Rich Message structural tags
+// (details/list/table wrappers from rich-html.ts's fitDetailsList and
+// mdToRichHtml). `truncateHtmlSafe` tracks these so a mid-line char cut can
+// re-close whatever was left open — omitting the structural tags here would
+// let a cut inside a `<details><ul><li>…` payload strand those wrappers open,
+// an unbalanced payload Telegram rejects with a 400. (Void tags like `<br/>` /
+// `<hr/>` self-close and are excluded by the `/>` check below.)
+const OPENABLE_TAGS = new Set([
+  "b", "i", "u", "s", "code", "pre", "a", "blockquote",
+  "details", "summary", "ul", "ol", "li", "table", "tr", "th", "td", "p",
+  "h1", "h2", "h3", "h4", "h5", "h6",
+]);
 
 /**
  * Char-truncate a single balanced-HTML line to at most `max` characters
@@ -214,6 +247,11 @@ export function truncateHtmlSafe(line: string, max: number): string {
           }
         }
       }
+    } else if (line[i] === "&") {
+      // Treat a complete `&…;` entity (named or numeric) as one atomic unit —
+      // cutting inside `&lt;` would leave a dangling `&l` in the payload.
+      const m = /^&(?:[a-zA-Z]{1,8}|#\d{1,7});/.exec(line.slice(i, i + 10));
+      next = i + (m ? m[0].length : 1);
     } else {
       // Advance by 2 over a surrogate pair (e.g. the emoji rows start with,
       // "✅ 🔧 …") so we never cut between a high/low surrogate.
@@ -358,9 +396,14 @@ export class LiveMessage {
 
   constructor(api: MessageApi, intervalMs: number, maxLen: number = LIVE_MAX_LEN) {
     this.maxLen = maxLen;
-    this.t = new Throttle(api, intervalMs, async (t) => {
-      await t.push(this.content, this.content);
-    });
+    this.t = new Throttle(
+      api,
+      intervalMs,
+      async (t) => {
+        await t.push(this.content, this.content);
+      },
+      maxLen,
+    );
   }
 
   set(html: string): void {

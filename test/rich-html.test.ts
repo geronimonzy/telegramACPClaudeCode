@@ -128,6 +128,33 @@ describe("mdToRichHtml — block types", () => {
     expect(out).toContain("<td><code>code</code></td>");
   });
 
+  // Regression (T17 review, Major): a `|` inside an inline code span was
+  // treated as a cell boundary, producing phantom columns.
+  it("a | inside an inline code span is cell content, not a boundary", () => {
+    const md = ["| a | b |", "| --- | --- |", "| `x|y` | c |"].join("\n");
+    const out = mdToRichHtml(md);
+    expect(out).toContain("<td><code>x|y</code></td>");
+    expect(out).toContain("<tr><td><code>x|y</code></td><td>c</td></tr>");
+    expect(isBalanced(out)).toBe(true);
+  });
+
+  it("\\| is a GFM-escaped literal pipe, not a boundary", () => {
+    const md = ["| a | b |", "| --- | --- |", "| x\\|y | c |"].join("\n");
+    const out = mdToRichHtml(md);
+    expect(out).toContain("<tr><td>x|y</td><td>c</td></tr>");
+    expect(isBalanced(out)).toBe(true);
+  });
+
+  // Regression (T17 review, Major): ragged body rows shifted the column grid.
+  it("ragged body rows are normalized to the header width", () => {
+    const md = ["| a | b |", "| --- | --- |", "| 1 | 2 | 3 |", "| only |"].join("\n");
+    const out = mdToRichHtml(md);
+    // Extra cell dropped, short row padded — every row has exactly 2 cells.
+    expect(out).toContain("<tr><td>1</td><td>2</td></tr>");
+    expect(out).toContain("<tr><td>only</td><td></td></tr>");
+    expect(isBalanced(out)).toBe(true);
+  });
+
   it("horizontal rule → <hr/>", () => {
     expect(mdToRichHtml("---")).toBe("<hr/>");
   });
