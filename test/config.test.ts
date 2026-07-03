@@ -22,7 +22,8 @@ describe("loadConfig", () => {
     expect(cfg.editIntervalMs).toBe(1500);
     expect(cfg.typingIntervalMs).toBe(4500);
     expect(cfg.showThoughts).toBe(false);
-    expect(cfg.adapterCommand).toEqual(["npx", "-y", "claude-agent-acp"]);
+    expect(cfg.adapterCommand).toHaveLength(1);
+    expect(cfg.adapterCommand[0]).toMatch(/node_modules[/\\]\.bin[/\\]claude-agent-acp$/);
     expect(cfg.projects).toEqual({});
     expect(cfg.dataDir).toMatch(/telegram-acp-bridge/);
   });

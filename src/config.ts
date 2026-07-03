@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface Config {
   botToken: string;
@@ -19,7 +20,16 @@ export interface Config {
 const DEFAULT_EDIT_INTERVAL_MS = 1500;
 const DEFAULT_TYPING_INTERVAL_MS = 4500;
 const DEFAULT_SHOW_THOUGHTS = false;
-const DEFAULT_ADAPTER_COMMAND = ["npx", "-y", "claude-agent-acp"];
+// The ACP adapter ships as a production dependency of this app, so the
+// default spawns the bundled copy. (The npm package is scoped —
+// @agentclientprotocol/claude-agent-acp — so `npx -y claude-agent-acp`
+// would 404 against the registry; and npx only finds the local bin when
+// the process happens to run from the app directory, which the systemd
+// service does not.) Resolved relative to this file: works from dist/
+// (installed and dev builds) and from src/ (tsx).
+const DEFAULT_ADAPTER_COMMAND = [
+  fileURLToPath(new URL("../node_modules/.bin/claude-agent-acp", import.meta.url)),
+];
 const DEFAULT_DATA_DIR = "~/.local/share/telegram-acp-bridge";
 
 function expandHome(path: string): string {

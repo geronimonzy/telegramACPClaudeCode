@@ -23,8 +23,7 @@
   "_comment_showThoughts": "Whether to forward the agent's thinking/reasoning blocks to Telegram (default false)",
   "showThoughts": false,
 
-  "_comment_adapterCommand": "Command used to spawn the ACP adapter process (default [\"npx\", \"-y\", \"claude-agent-acp\"])",
-  "adapterCommand": ["npx", "-y", "claude-agent-acp"],
+  "_comment_adapterCommand": "Optional override for the command used to spawn the ACP adapter process, e.g. [\"/path/to/claude-agent-acp\"]. When omitted (recommended), the claude-agent-acp binary bundled with this app is used (node_modules/.bin/claude-agent-acp).",
 
   "_comment_adapterEnv": "Extra environment variables passed to the adapter process",
   "adapterEnv": {},

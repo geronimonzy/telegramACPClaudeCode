@@ -80,9 +80,18 @@ cp "${SCRIPT_DIR}/package-lock.json" "${INSTALL_DIR}/package-lock.json"
 log "installing production dependencies (npm ci --omit=dev)"
 (cd "${INSTALL_DIR}" && npm ci --omit=dev)
 
-cat > "${INSTALL_DIR}/bin/telegram-acp-bridge" <<'LAUNCHER'
+# Bake node's bin directory into the launcher PATH: systemd --user services
+# get a minimal PATH without nvm/asdf-managed installations, so a bare
+# `exec node` fails with 127 under the service even though it works in an
+# interactive shell. Prepending the directory (rather than hardcoding only the
+# node binary) also covers `npx`, which the bridge uses to spawn the ACP
+# adapter at runtime.
+NODE_DIR="$(dirname "$(command -v node)")"
+cat > "${INSTALL_DIR}/bin/telegram-acp-bridge" <<LAUNCHER
 #!/usr/bin/env sh
-exec node "$(dirname "$0")/../dist/index.js" "$@"
+PATH="${NODE_DIR}:\${PATH}"
+export PATH
+exec node "\$(dirname "\$0")/../dist/index.js" "\$@"
 LAUNCHER
 chmod +x "${INSTALL_DIR}/bin/telegram-acp-bridge"
 
