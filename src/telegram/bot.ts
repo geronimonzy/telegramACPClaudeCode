@@ -7,6 +7,7 @@
 // updates and hands them to the Bridge. All behaviour lives in bridge.ts.
 
 import { Bot, InputFile, type Context } from "grammy";
+import { run, type RunnerHandle } from "@grammyjs/runner";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { Message } from "@grammyjs/types";
 import type { Config } from "../config.js";
@@ -187,7 +188,7 @@ export async function runBot(cfg: Config): Promise<void> {
     }, SHUTDOWN_TIMEOUT_MS);
     hardExit.unref();
     try {
-      await bot.stop();
+      await runner.stop();
       await bridge.shutdown();
     } catch (e) {
       log.error({ err: e }, "shutdown failed");
@@ -198,5 +199,17 @@ export async function runBot(cfg: Config): Promise<void> {
   process.once("SIGINT", () => void stop("SIGINT"));
   process.once("SIGTERM", () => void stop("SIGTERM"));
 
-  await bot.start();
+  // Use the concurrent runner rather than bot.start(): grammY's built-in
+  // long polling handles updates strictly sequentially and will not poll for
+  // new updates until the current handler returns. A prompt turn blocks its
+  // handler for the whole turn (including while it waits for a permission
+  // tap), so under bot.start() the Allow/Reject callback could never be
+  // fetched — a hard deadlock on any turn that needs an interactive
+  // permission. The runner processes the callback concurrently with the
+  // blocked turn handler, which is what lets the tap through. Do NOT add
+  // sequentialize keyed by chat/thread here: that would re-serialize a
+  // permission callback behind its own topic's in-flight turn and
+  // reintroduce the deadlock.
+  const runner: RunnerHandle = run(bot);
+  await runner.task();
 }
