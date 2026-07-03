@@ -142,6 +142,55 @@ describe("AgentSession", () => {
     await s.dispose();
   });
 
+  it("suppresses user/agent message chunks during session/load replay but forwards other updates", async () => {
+    const { agent, clientStream } = wireMockAgent([
+      [
+        {
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "post-load reply" },
+          },
+        },
+      ],
+    ]);
+    agent.loadReplay = [
+      {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "old user msg" },
+      },
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "old agent msg" },
+      },
+      {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [{ name: "review", description: "d" }],
+      },
+    ];
+
+    const updates: acp.SessionUpdate[] = [];
+    const s = await AgentSession.start({
+      cwd: "/tmp",
+      stream: clientStream,
+      loadSessionId: "sess_mock_1",
+      onUpdate: (u) => updates.push(u),
+      onPermission: noopPermission,
+      onExit: () => {},
+    });
+
+    expect(s.loaded).toBe(true);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.sessionUpdate).toBe("available_commands_update");
+    expect(s.availableCommands[0]?.name).toBe("review");
+
+    const res = await s.prompt([{ type: "text", text: "hello again" }]);
+    expect(res.stopReason).toBe("end_turn");
+    expect(updates).toHaveLength(2);
+    expect(updates[1]?.sessionUpdate).toBe("agent_message_chunk");
+
+    await s.dispose();
+  });
+
   it("routes permission requests through onPermission", async () => {
     const { agent, clientStream } = wireMockAgent([
       [

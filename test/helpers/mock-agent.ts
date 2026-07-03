@@ -66,6 +66,12 @@ export class MockAgent implements acp.Agent {
   lastStopReason: acp.StopReason = "end_turn";
   /** Set true when `cancel()` arrives; an active turn then resolves `"cancelled"`. */
   cancelled = false;
+  /**
+   * Updates replayed via `sessionUpdate` during a successful `loadSession`
+   * call, before the response is returned. Lets tests exercise session/load
+   * replay handling (e.g. chunk suppression) without a full prompt turn.
+   */
+  loadReplay: acp.SessionUpdate[] = [];
 
   #currentModeId = "default";
   #conn: () => acp.AgentSideConnection;
@@ -95,9 +101,13 @@ export class MockAgent implements acp.Agent {
     };
   }
 
-  loadSession(params: acp.LoadSessionRequest): acp.LoadSessionResponse {
+  async loadSession(params: acp.LoadSessionRequest): Promise<acp.LoadSessionResponse> {
     if (params.sessionId !== MOCK_SESSION_ID) {
       throw acp.RequestError.resourceNotFound(params.sessionId);
+    }
+    const conn = this.#conn();
+    for (const update of this.loadReplay) {
+      await conn.sessionUpdate({ sessionId: params.sessionId, update });
     }
     return {
       modes: {
