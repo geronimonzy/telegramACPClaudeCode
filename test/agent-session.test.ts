@@ -191,6 +191,61 @@ describe("AgentSession", () => {
     await s.dispose();
   });
 
+  it("with onReplayChunk set, replay chunks route to the callback and NOT to onUpdate", async () => {
+    const { agent, clientStream } = wireMockAgent();
+    agent.loadReplay = [
+      { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old user" } },
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old agent" } },
+      {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [{ name: "review", description: "d" }],
+      },
+    ];
+
+    const updates: acp.SessionUpdate[] = [];
+    const replay: acp.SessionUpdate[] = [];
+    const s = await AgentSession.start({
+      cwd: "/tmp",
+      stream: clientStream,
+      loadSessionId: "sess_mock_1",
+      onUpdate: (u) => updates.push(u),
+      onReplayChunk: (u) => replay.push(u),
+      onPermission: noopPermission,
+      onExit: () => {},
+    });
+
+    expect(s.loaded).toBe(true);
+    // Chunks went to onReplayChunk, not onUpdate.
+    expect(replay.map((u) => u.sessionUpdate)).toEqual([
+      "user_message_chunk",
+      "agent_message_chunk",
+    ]);
+    // Non-chunk replay update still reaches onUpdate.
+    expect(updates.map((u) => u.sessionUpdate)).toEqual(["available_commands_update"]);
+
+    await s.dispose();
+  });
+
+  it("listSessions passes through to the agent's session/list", async () => {
+    const { agent, clientStream } = wireMockAgent();
+    agent.listSessionsResponse = [
+      { sessionId: "s1", cwd: "/a", title: "One", updatedAt: "2026-01-01T00:00:00Z" },
+      { sessionId: "s2", cwd: "/b", title: "Two", updatedAt: "2026-01-02T00:00:00Z" },
+    ];
+    const s = await AgentSession.start({
+      cwd: "/tmp",
+      stream: clientStream,
+      onUpdate: () => {},
+      onPermission: noopPermission,
+      onExit: () => {},
+    });
+
+    const res = await s.listSessions({});
+    expect(res.sessions.map((x) => x.sessionId)).toEqual(["s1", "s2"]);
+
+    await s.dispose();
+  });
+
   it("routes permission requests through onPermission", async () => {
     const { agent, clientStream } = wireMockAgent([
       [

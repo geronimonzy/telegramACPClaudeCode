@@ -90,8 +90,8 @@ Copy `config.example.json` (or let `install.sh` do it — see below) to
 | `botToken` | string | yes | — | Bot token from BotFather. |
 | `forumChatId` | number | yes | — | The forum supergroup's chat id (see step 4). |
 | `allowedUserIds` | number[] | yes (non-empty) | — | Telegram user ids allowed to interact with the bridge. Everyone else is ignored. |
-| `defaultCwd` | string | yes | — | Working directory for a new session when `/new` is given no name that maps to a `projects` entry. |
-| `projects` | object (string → string) | no | `{}` | Named shortcuts: `/new <name>` uses `projects[name]` as the cwd if present. |
+| `defaultCwd` | string | yes | — | Working directory for a new session when `/new` is given no argument. |
+| `projects` | object (string → string) | no | `{}` | Named shortcuts: `/new <name>` uses `projects[name]` as the cwd. `/new` also accepts an absolute or `~` path directly. |
 | `editIntervalMs` | number | no | `1500` | Minimum interval between live-message edits while a response streams. |
 | `typingIntervalMs` | number | no | `4500` | Interval for refreshing the "typing…" chat action while a turn is in flight. |
 | `showThoughts` | boolean | no | `false` | Forward the agent's thinking/reasoning blocks to Telegram. |
@@ -155,12 +155,16 @@ touches an existing `config.json`.
 
 ## Command reference
 
-Commands run inside a session topic unless noted. `/new` also works from
-General or any topic (it always creates a *new* topic).
+Commands run inside a session topic unless noted. `/new` and `/sessions` also
+work from General or any topic (they always create a *new* topic).
+
+Topic titles are always a random three-word name (e.g. `amber-falcon-tide`),
+regardless of the working directory chosen.
 
 | Command | Description |
 |---|---|
-| `/new [name]` | Start a new session topic. `name` also selects a `projects` cwd if configured. |
+| `/new [path\|project]` | Start a new session topic. With no argument the cwd is `defaultCwd`. An absolute or `~` path selects that directory (it must exist). Any other argument must be a key in `projects`. The topic gets a random three-word title either way. |
+| `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic, replays the session's **full** history as a readable transcript, and goes live. Works from General or any topic. |
 | `/end` | End this session and close the topic. |
 | `/cancel` | Cancel the in-flight turn. |
 | `/mode` | Choose the agent mode (inline keyboard of modes the agent advertises). |
@@ -177,9 +181,9 @@ known; otherwise the bridge replies that it's unknown. Plain text (no leading
 send next in that topic (a photo/document with no accompanying text is held
 until you do).
 
-General topic behavior: messages sent outside any topic only accept `/new`;
-anything else gets a short reminder to use `/new` or to talk inside a session
-topic.
+General topic behavior: messages sent outside any topic only accept `/new`
+and `/sessions`; anything else gets a short reminder to use `/new` or to talk
+inside a session topic.
 
 ## Troubleshooting
 

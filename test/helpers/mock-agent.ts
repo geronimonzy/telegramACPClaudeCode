@@ -72,6 +72,11 @@ export class MockAgent implements acp.Agent {
    * replay handling (e.g. chunk suppression) without a full prompt turn.
    */
   loadReplay: acp.SessionUpdate[] = [];
+  /**
+   * Sessions returned by `session/list`. Additive test hook (like
+   * {@link loadReplay}) so bridge tests can script a `/sessions` listing.
+   */
+  listSessionsResponse: acp.SessionInfo[] = [];
 
   #currentModeId = "default";
   #conn: () => acp.AgentSideConnection;
@@ -86,6 +91,7 @@ export class MockAgent implements acp.Agent {
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true, embeddedContext: true },
+        sessionCapabilities: { list: {} },
       },
     };
   }
@@ -120,6 +126,10 @@ export class MockAgent implements acp.Agent {
 
   authenticate(_params: acp.AuthenticateRequest): acp.AuthenticateResponse {
     return {};
+  }
+
+  listSessions(_params: acp.ListSessionsRequest): acp.ListSessionsResponse {
+    return { sessions: this.listSessionsResponse };
   }
 
   async setSessionMode(

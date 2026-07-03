@@ -19,6 +19,14 @@ export interface AgentSessionOptions {
   stream?: acp.Stream; // test injection path
   loadSessionId?: string; // if set, try session/load instead of session/new
   client?: Partial<acp.Client>; // extra handlers merged in (fs/terminal from Task 6)
+  /**
+   * When set, the `user_message_chunk` / `agent_message_chunk` updates that are
+   * otherwise SUPPRESSED during `session/load` replay are routed here instead of
+   * being dropped. Absent → exactly the restart-recovery behaviour (chunks
+   * dropped). Non-chunk replay updates keep their normal `onUpdate` handling
+   * either way. Used by `/sessions` attach to stream the full history transcript.
+   */
+  onReplayChunk?: (u: acp.SessionUpdate) => void;
 }
 
 const CLIENT_INFO: acp.Implementation = {
@@ -47,6 +55,7 @@ export class AgentSession {
   readonly #onUpdate: AgentSessionOptions["onUpdate"];
   readonly #onPermission: AgentSessionOptions["onPermission"];
   readonly #onExit: AgentSessionOptions["onExit"];
+  readonly #onReplayChunk: AgentSessionOptions["onReplayChunk"];
 
   #modes?: acp.SessionModeState;
   #configOptions: acp.SessionConfigOption[] = [];
@@ -60,6 +69,7 @@ export class AgentSession {
     this.#onUpdate = opts.onUpdate;
     this.#onPermission = opts.onPermission;
     this.#onExit = opts.onExit;
+    this.#onReplayChunk = opts.onReplayChunk;
     this.#child = child;
   }
 
@@ -188,6 +198,17 @@ export class AgentSession {
   }
 
   /**
+   * List the agent's known sessions (`session/list`). Only meaningful when the
+   * agent advertises the `sessionCapabilities.list` capability (Claude Code
+   * does). A thin passthrough — the caller filters/paginates.
+   */
+  async listSessions(
+    params: acp.ListSessionsRequest = {},
+  ): Promise<acp.ListSessionsResponse> {
+    return this.#conn.listSessions(params);
+  }
+
+  /**
    * Switch the agent's mode. Uses `session/set_config_option` when a config
    * option with category `"mode"` exists, otherwise `session/set_mode`.
    */
@@ -270,13 +291,16 @@ export class AgentSession {
         break;
     }
 
-    // During session/load replay, suppress the historical message chunks so we
-    // don't re-spam the Telegram topic on restart recovery.
+    // During session/load replay, the historical message chunks are NOT sent to
+    // onUpdate: on restart recovery they'd re-spam the Telegram topic. When an
+    // onReplayChunk sink is provided (the /sessions attach flow), route them
+    // there to build a transcript; otherwise drop them (restart-recovery path).
     if (
       this.#replaying &&
       (update.sessionUpdate === "user_message_chunk" ||
         update.sessionUpdate === "agent_message_chunk")
     ) {
+      this.#onReplayChunk?.(update);
       return;
     }
 

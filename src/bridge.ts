@@ -12,6 +12,7 @@
 // threads it through). All logic lives here — bot.ts is a thin adapter.
 
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
@@ -22,6 +23,8 @@ import { escapeHtml } from "./html.js";
 import { log } from "./log.js";
 import { StateStore, type SessionState } from "./state.js";
 import { TopicSession, type TopicUi } from "./orchestrator.js";
+import { MessageDraft } from "./telegram/draft.js";
+import { randomName } from "./telegram/names.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import type { MessageApi } from "./telegram/live-message.js";
 
@@ -79,10 +82,21 @@ const ICON_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_MSG_LIMIT = 4000;
+/** How many resumable sessions `/sessions` offers to attach at once. */
+const MAX_LISTED_SESSIONS = 10;
+/** Telegram forum-topic titles are capped at 128 chars; keep well under. */
+const MAX_TITLE_LEN = 64;
+
+/** Expand a leading `~` / `~/` to the user's home directory. */
+function expandHome(p: string): string {
+  if (p === "~" || p.startsWith("~/")) return path.join(homedir(), p.slice(1));
+  return p;
+}
 
 /** The command list registered with Telegram (BotCommandScopeChat in bot.ts). */
 export const COMMAND_LIST: Array<{ command: string; description: string }> = [
-  { command: "new", description: "Start a new session topic" },
+  { command: "new", description: "Start a new session topic (optional path/project)" },
+  { command: "sessions", description: "List resumable sessions to attach" },
   { command: "end", description: "End this session and close the topic" },
   { command: "cancel", description: "Cancel the in-flight turn" },
   { command: "mode", description: "Choose the agent mode" },
@@ -147,6 +161,11 @@ function logError(context: string, e: unknown): void {
   log.error({ err: e }, `[bridge] ${context}`);
 }
 
+/** Truncate to `max` chars, appending an ellipsis when cut. */
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
 export class Bridge {
   readonly #cfg: Config;
   readonly #botApi: BotApi;
@@ -158,6 +177,12 @@ export class Bridge {
   readonly #sessions = new Map<number, TopicSession>();
 
   #seq = 0;
+
+  // Attach targets from the LAST `/sessions` call, keyed by a global counter
+  // that the `attach:{k}` callback_data references. Cleared wholesale on each
+  // new `/sessions` call and per-entry on use, so a stale button is a no-op.
+  #attachSeq = 0;
+  readonly #attachTargets = new Map<number, { sessionId: string; cwd: string; title: string }>();
 
   constructor(
     cfg: Config,
@@ -208,18 +233,22 @@ export class Bridge {
   }
 
   /**
-   * Create a new forum topic + agent session. `reply` targets whichever topic
-   * the `/new` was issued from (General or a session topic); the substantive
-   * intro is sent into the newly created topic.
+   * Create a new forum topic + agent session. `arg` selects the working
+   * directory (an absolute/`~` path that must exist, or a `cfg.projects` key);
+   * the topic TITLE is always a random three-word name. `reply` targets
+   * whichever topic the `/new` was issued from (General or a session topic);
+   * the substantive intro is sent into the newly created topic.
    */
   async newTopic(
-    name: string | undefined,
+    arg: string | undefined,
     reply: (html: string) => Promise<void>,
   ): Promise<void> {
+    const cwd = await this.#resolveNewCwd(arg, reply);
+    if (cwd === undefined) return; // an error reply was already sent; create nothing.
+
     const n = ++this.#seq;
-    const title = name && name.length > 0 ? name : `claude-${n}`;
+    const title = randomName();
     const iconColor = ICON_COLORS[(n - 1) % ICON_COLORS.length]!;
-    const cwd = (name ? this.#cfg.projects[name] : undefined) ?? this.#cfg.defaultCwd;
 
     let threadId: number;
     try {
@@ -270,9 +299,51 @@ export class Bridge {
   }
 
   /**
+   * Resolve the working directory for `/new <arg>`. Returns the cwd, or
+   * `undefined` after sending an error reply (caller then creates nothing):
+   *   - no arg → defaultCwd;
+   *   - arg starting with `/` or `~` → expanded path that MUST be an existing
+   *     directory (else `⚠️ not a directory: <path>`);
+   *   - otherwise → a `cfg.projects` key (else list the known projects).
+   */
+  async #resolveNewCwd(
+    arg: string | undefined,
+    reply: (html: string) => Promise<void>,
+  ): Promise<string | undefined> {
+    if (!arg) return this.#cfg.defaultCwd;
+
+    if (arg.startsWith("/") || arg.startsWith("~")) {
+      const expanded = expandHome(arg);
+      try {
+        const st = await stat(expanded);
+        if (!st.isDirectory()) {
+          await reply(`⚠️ not a directory: <code>${escapeHtml(expanded)}</code>`);
+          return undefined;
+        }
+      } catch {
+        await reply(`⚠️ not a directory: <code>${escapeHtml(expanded)}</code>`);
+        return undefined;
+      }
+      return expanded;
+    }
+
+    const mapped = this.#cfg.projects[arg];
+    if (mapped) return mapped;
+
+    const known = Object.keys(this.#cfg.projects);
+    const list = known.length > 0 ? known.map((k) => `<code>${escapeHtml(k)}</code>`).join(", ") : "(none)";
+    await reply(
+      `⚠️ unknown project: <code>${escapeHtml(arg)}</code>\n` +
+        `Known projects: ${list}\n` +
+        `Absolute paths (starting with <code>/</code> or <code>~</code>) are also accepted.`,
+    );
+    return undefined;
+  }
+
+  /**
    * Route one inbound message. `threadId === undefined` is the General topic
-   * (only `/new` is accepted there); a session topic dispatches the full command
-   * table, uploads and plain-text prompts.
+   * (only `/new` and `/sessions` are accepted there); a session topic dispatches
+   * the full command table, uploads and plain-text prompts.
    */
   async handleMessage(threadId: number | undefined, msg: IncomingMsg): Promise<void> {
     if (threadId === undefined) {
@@ -285,6 +356,12 @@ export class Bridge {
     // `/new` works from any topic (creates a *new* one).
     if (cmd?.cmd === "new") {
       await this.newTopic(cmd.args || undefined, (h) => this.#send(threadId, h));
+      return;
+    }
+
+    // `/sessions` works from any topic (the listing posts back into this one).
+    if (cmd?.cmd === "sessions") {
+      await this.#handleSessions(threadId);
       return;
     }
 
@@ -314,6 +391,7 @@ export class Bridge {
     if (data.startsWith("perm:")) return this.#handlePermCallback(data, callbackMessageId);
     if (data.startsWith("mode:")) return this.#handleModeCallback(data, callbackMessageId);
     if (data.startsWith("restart:")) return this.#handleRestartCallback(data);
+    if (data.startsWith("attach:")) return this.#handleAttachCallback(data);
     return undefined;
   }
 
@@ -654,6 +732,156 @@ export class Bridge {
     }
   }
 
+  // --- /sessions + attach --------------------------------------------------
+
+  /**
+   * List the agent's resumable sessions into `replyThreadId` (undefined =
+   * General), filtering out ids already attached in this process, and offer an
+   * inline `attach:{k}` button per remaining session (most recent ~10).
+   */
+  async #handleSessions(replyThreadId: number | undefined): Promise<void> {
+    let sessions: acp.SessionInfo[];
+    try {
+      sessions = await this.#fetchSessions();
+    } catch (e) {
+      logError("listSessions failed", e);
+      await this.#send(replyThreadId, "⚠️ could not list sessions — see logs.");
+      return;
+    }
+
+    const attached = new Set(this.#store.list().map((s) => s.acpSessionId));
+    const available = sessions
+      .filter((s) => !attached.has(s.sessionId))
+      .slice(0, MAX_LISTED_SESSIONS);
+
+    if (available.length === 0) {
+      await this.#send(replyThreadId, "No resumable sessions to attach.");
+      return;
+    }
+
+    // A fresh listing supersedes the previous one: drop all stale targets.
+    this.#attachTargets.clear();
+
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    const lines: string[] = ["📂 <b>Resumable sessions</b> — tap to attach:"];
+    let i = 0;
+    for (const s of available) {
+      const k = ++this.#attachSeq;
+      const title = (s.title ?? "").trim() || randomName();
+      this.#attachTargets.set(k, { sessionId: s.sessionId, cwd: s.cwd, title });
+      i += 1;
+      const date = s.updatedAt ? new Date(s.updatedAt).toISOString().slice(0, 16).replace("T", " ") : "";
+      lines.push(
+        `\n<b>${i}.</b> ${escapeHtml(truncate(title, 80))}\n` +
+          `<code>${escapeHtml(s.cwd)}</code>${date ? ` · ${escapeHtml(date)}` : ""}`,
+      );
+      rows.push([{ text: `${i}. ${truncate(title, 40)}`, callback_data: `attach:${k}` }]);
+    }
+
+    await this.#send(replyThreadId, lines.join("\n"), { inline_keyboard: rows });
+  }
+
+  /**
+   * Obtain a live AgentSession to call `session/list`. Reuses any existing
+   * topic's agent when present; otherwise spawns a short-lived throwaway
+   * (defaultCwd) and disposes it right after listing.
+   */
+  async #fetchSessions(): Promise<acp.SessionInfo[]> {
+    const existing = this.#sessions.values().next().value as TopicSession | undefined;
+    if (existing) {
+      const res = await existing.agentSession.listSessions({});
+      return res.sessions;
+    }
+    const agent = await this.#startAgent({
+      cwd: this.#cfg.defaultCwd,
+      spawn: { command: this.#cfg.adapterCommand, env: this.#cfg.adapterEnv },
+      client: { ...makeFsHandlers(), ...this.#terminals.handlers() },
+      onUpdate: () => {},
+      onPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      onExit: () => {},
+    });
+    try {
+      const res = await agent.listSessions({});
+      return res.sessions;
+    } finally {
+      await agent.dispose().catch((e) => logError("throwaway dispose failed", e));
+    }
+  }
+
+  /**
+   * Attach the session behind an `attach:{k}` button: create a forum topic,
+   * `session/load` it, and stream its FULL history into the topic as a readable
+   * transcript before persisting it like any other topic.
+   */
+  async #handleAttachCallback(data: string): Promise<{ toast: string }> {
+    const k = Number(data.slice("attach:".length));
+    const target = this.#attachTargets.get(k);
+    if (!target) return { toast: "session no longer listed" };
+    this.#attachTargets.delete(k); // evict on use
+
+    const title = truncate(target.title, MAX_TITLE_LEN);
+    const n = ++this.#seq;
+    const iconColor = ICON_COLORS[(n - 1) % ICON_COLORS.length]!;
+
+    let threadId: number;
+    try {
+      threadId = await this.#botApi.createForumTopic(title, iconColor);
+    } catch (e) {
+      logError("attach createForumTopic failed", e);
+      return { toast: "could not create topic" };
+    }
+
+    // Build a transcript draft; the AgentSession routes suppressed replay chunks
+    // to onReplayChunk during session/load, and we append them with role
+    // separators. MessageDraft owns HTML conversion, rollover and throttling.
+    const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
+      intervalMs: this.#cfg.editIntervalMs,
+    });
+    let lastRole: "user" | "agent" | undefined;
+    const onReplayChunk = (u: acp.SessionUpdate): void => {
+      let role: "user" | "agent";
+      let text: string | undefined;
+      if (u.sessionUpdate === "user_message_chunk") {
+        role = "user";
+        if (u.content.type === "text") text = u.content.text;
+      } else if (u.sessionUpdate === "agent_message_chunk") {
+        role = "agent";
+        if (u.content.type === "text") text = u.content.text;
+      } else {
+        return;
+      }
+      if (text === undefined) return;
+      if (role !== lastRole) {
+        draft.append(role === "user" ? "\n👤 **You:**\n" : "\n🤖\n");
+        lastRole = role;
+      }
+      draft.append(text);
+    };
+
+    let session: TopicSession;
+    try {
+      session = await this.#spawnTopic(threadId, target.cwd, target.sessionId, onReplayChunk);
+    } catch (e) {
+      logError("attach spawn failed", e);
+      await draft.finalize().catch(() => {});
+      await this.#send(threadId, "💥 could not attach the session — /new to start fresh.");
+      return { toast: "attach failed" };
+    }
+
+    await draft.finalize();
+
+    const agent = session.agentSession;
+    await this.#store.upsert({
+      threadId,
+      acpSessionId: agent.sessionId,
+      cwd: target.cwd,
+      title,
+      createdAt: new Date().toISOString(),
+    });
+    await this.#send(threadId, "📎 attached — full history above; the session is live");
+    return { toast: "attached" };
+  }
+
   // --- helpers -------------------------------------------------------------
 
   async #handleGeneral(msg: IncomingMsg): Promise<void> {
@@ -662,9 +890,13 @@ export class Bridge {
       await this.newTopic(cmd.args || undefined, (h) => this.#send(undefined, h));
       return;
     }
+    if (cmd?.cmd === "sessions") {
+      await this.#handleSessions(undefined);
+      return;
+    }
     await this.#send(
       undefined,
-      "This is the General topic. Use /new [name] to start a session; per-session commands run inside a session's own topic.",
+      "This is the General topic. Use /new [path|project] to start a session or /sessions to attach an existing one; per-session commands run inside a session's own topic.",
     );
   }
 
@@ -685,12 +917,14 @@ export class Bridge {
     threadId: number,
     cwd: string,
     loadSessionId: string | undefined,
+    onReplayChunk?: (u: acp.SessionUpdate) => void,
   ): Promise<TopicSession> {
     const ui = this.#makeUi(threadId);
     let session: TopicSession | undefined;
     const agent = await this.#startAgent({
       cwd,
       loadSessionId,
+      ...(onReplayChunk ? { onReplayChunk } : {}),
       spawn: { command: this.#cfg.adapterCommand, env: this.#cfg.adapterEnv },
       client: { ...makeFsHandlers(), ...this.#terminals.handlers() },
       onUpdate: (u) => session?.handleUpdate(u),

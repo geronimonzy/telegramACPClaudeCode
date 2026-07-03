@@ -36,7 +36,7 @@ function makeConfig(): Config {
   };
 }
 
-function makeBridge() {
+function makeBridge(onAgent?: (a: MockAgent) => void) {
   const cfg = makeConfig();
   const botApi = new FakeBotApi();
   const store = new StateStore(join(dir, "state.json"));
@@ -46,6 +46,9 @@ function makeBridge() {
     const { agent, clientStream, agentStream } = wireMockAgent();
     mocks.push(agent);
     agentStreams.push(agentStream);
+    // Configure the freshly-created mock BEFORE start() runs initialize /
+    // loadSession, so scripted listSessions/loadReplay are in place in time.
+    onAgent?.(agent);
     return AgentSession.start({ ...opts, stream: clientStream, spawn: undefined });
   };
   const bridge = new Bridge(cfg, botApi, store, starter);
@@ -54,46 +57,84 @@ function makeBridge() {
 
 const tick = () => new Promise((r) => setTimeout(r, 15));
 
+const NAME_RE = /^[a-z]{3,8}-[a-z]{3,8}-[a-z]{3,8}$/;
+
 function textOf(mock: MockAgent, i = 0): string {
   const b = mock.received[i]?.prompt[0];
   return b && b.type === "text" ? b.text : "";
 }
 
 describe("Bridge", () => {
-  it("/new creates a topic, posts an intro, and persists a store entry", async () => {
-    const { bridge, botApi, store } = makeBridge();
+  it("/new <project> resolves cwd from cfg.projects, random title, persists entry", async () => {
+    const { bridge, botApi, store, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
     const replies: string[] = [];
     await bridge.newTopic("myproj", async (h) => void replies.push(h));
 
     expect(botApi.topics).toHaveLength(1);
     const threadId = botApi.topics[0]!.threadId;
-    expect(botApi.topics[0]!.name).toBe("myproj");
+    // Title is a random three-word name (NOT the project arg).
+    expect(botApi.topics[0]!.name).toMatch(NAME_RE);
 
     const intro = botApi.htmlFor(threadId).join("\n");
-    expect(intro).toContain("myproj");
+    expect(intro).toContain(dir); // resolved cwd shown
     expect(intro).toContain("cwd");
     expect(intro).toContain("/commands");
 
     const entry = store.get(threadId);
-    expect(entry?.title).toBe("myproj");
+    expect(entry?.title).toMatch(NAME_RE);
+    expect(entry?.cwd).toBe(dir);
     expect(entry?.acpSessionId).toBe("sess_mock_1");
     expect(replies.some((r) => /Created/.test(r))).toBe(true);
   });
 
-  it("defaults the topic name to claude-{n} and cycles icon colors", async () => {
-    const { bridge, botApi } = makeBridge();
+  it("bare /new uses defaultCwd; titles are random and icon colors cycle", async () => {
+    const { bridge, botApi, store } = makeBridge();
     await bridge.newTopic(undefined, async () => {});
     await bridge.newTopic(undefined, async () => {});
-    expect(botApi.topics[0]!.name).toBe("claude-1");
-    expect(botApi.topics[1]!.name).toBe("claude-2");
+    expect(botApi.topics[0]!.name).toMatch(NAME_RE);
+    expect(botApi.topics[1]!.name).toMatch(NAME_RE);
+    expect(botApi.topics[0]!.name).not.toBe(botApi.topics[1]!.name);
     expect(botApi.topics[0]!.iconColor).toBe(7322096);
     expect(botApi.topics[1]!.iconColor).toBe(16766590);
+    // Both resolved to defaultCwd (dir).
+    expect(store.get(botApi.topics[0]!.threadId)?.cwd).toBe(dir);
+  });
+
+  it("/new <absolute existing dir> uses it as cwd", async () => {
+    const { bridge, botApi, store } = makeBridge();
+    const proj = await mkdtemp(join(tmpdir(), "bridge-proj-"));
+    await bridge.newTopic(proj, async () => {});
+    const t = botApi.topics[0]!.threadId;
+    expect(store.get(t)?.cwd).toBe(proj);
+    expect(botApi.topics[0]!.name).toMatch(NAME_RE);
+    await rm(proj, { recursive: true, force: true });
+  });
+
+  it("/new <non-directory path> errors and creates nothing", async () => {
+    const { bridge, botApi } = makeBridge();
+    const replies: string[] = [];
+    await bridge.newTopic("/no/such/dir/here", async (h) => void replies.push(h));
+    expect(replies.join("\n")).toContain("not a directory");
+    expect(botApi.topics).toHaveLength(0);
+  });
+
+  it("/new <unknown project> lists known projects and creates nothing", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { alpha: dir, beta: dir };
+    const replies: string[] = [];
+    await bridge.newTopic("nope", async (h) => void replies.push(h));
+    const html = replies.join("\n");
+    expect(html).toContain("unknown project");
+    expect(html).toContain("alpha");
+    expect(html).toContain("beta");
+    expect(botApi.topics).toHaveLength(0);
   });
 
   it("routes text to the right TopicSession across two interleaved topics", async () => {
     const { bridge, botApi, mocks } = makeBridge();
-    await bridge.newTopic("a", async () => {});
-    await bridge.newTopic("b", async () => {});
+    await bridge.newTopic(undefined, async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
     const t2 = botApi.topics[1]!.threadId;
 
@@ -107,7 +148,7 @@ describe("Bridge", () => {
 
   it("/mode lists the agent's modes and a mode: callback switches mode", async () => {
     const { bridge, botApi } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     await bridge.handleMessage(t1, { text: "/mode" });
@@ -131,7 +172,7 @@ describe("Bridge", () => {
 
   it("unknown /frobnicate replies 'Unknown command' and never forwards to the agent", async () => {
     const { bridge, botApi, mocks } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     await bridge.handleMessage(t1, { text: "/frobnicate now" });
@@ -142,7 +183,7 @@ describe("Bridge", () => {
 
   it("forwards a known agent command verbatim as a single text block", async () => {
     const { bridge, botApi, mocks } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     // Turn 0 advertises "review" (that is how the bridge learns known slashes);
@@ -170,7 +211,7 @@ describe("Bridge", () => {
 
   it("a hyphenated unknown slash command (/pr-comments) is refused, never forwarded", async () => {
     const { bridge, botApi, mocks } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     // Regression for the parseCommand name-capture bug: `[A-Za-z0-9_:]+`
@@ -185,7 +226,7 @@ describe("Bridge", () => {
 
   it("forwards a hyphenated agent command verbatim when it is advertised", async () => {
     const { bridge, botApi, mocks } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     mocks[0]!.script = [
@@ -211,7 +252,7 @@ describe("Bridge", () => {
 
   it("/end disposes the session, removes the store entry, and closes the topic", async () => {
     const { bridge, botApi, store } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     await bridge.handleMessage(t1, { text: "/end" });
@@ -222,11 +263,11 @@ describe("Bridge", () => {
 
   it("/new pins the intro message in the new topic", async () => {
     const { bridge, botApi } = makeBridge();
-    await bridge.newTopic("pinme", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     // The intro is the first message sent into the new topic; it must be pinned.
-    const intro = botApi.messages.find((m) => m.threadId === t1 && /pinme/.test(m.html));
+    const intro = botApi.messages.find((m) => m.threadId === t1 && /cwd/.test(m.html));
     expect(intro).toBeDefined();
     expect(botApi.pins).toContainEqual({ threadId: t1, messageId: intro!.messageId });
   });
@@ -234,7 +275,7 @@ describe("Bridge", () => {
   it("/end releases the session's terminals and removes its uploads dir", async () => {
     const releaseSpy = vi.spyOn(TerminalRegistry.prototype, "releaseForSession");
     const { bridge, botApi, cfg } = makeBridge();
-    await bridge.newTopic("a", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
 
     // Seed an uploads dir for this topic (as a document upload would).
@@ -253,7 +294,7 @@ describe("Bridge", () => {
 
   it("agent death posts a Restart button; tapping it respawns the session", async () => {
     const { bridge, botApi, mocks, agentStreams } = makeBridge();
-    await bridge.newTopic("dies", async () => {});
+    await bridge.newTopic(undefined, async () => {});
     const t1 = botApi.topics[0]!.threadId;
     expect(mocks).toHaveLength(1);
 
@@ -320,8 +361,9 @@ describe("Bridge", () => {
     await bridge.handleMessage(undefined, { text: "/status" });
     expect(botApi.htmlFor(undefined).join("\n")).toContain("General topic");
 
-    await bridge.handleMessage(undefined, { text: "/new fromgeneral" });
-    expect(botApi.topics.some((t) => t.name === "fromgeneral")).toBe(true);
+    await bridge.handleMessage(undefined, { text: "/new" });
+    expect(botApi.topics).toHaveLength(1);
+    expect(botApi.topics[0]!.name).toMatch(NAME_RE);
   });
 
   describe("/file containment", () => {
@@ -337,7 +379,7 @@ describe("Bridge", () => {
       const cwd = await mkdtemp(join(tmpdir(), "bridge-file-"));
       scratchDirs.push(cwd);
       cfg.defaultCwd = cwd;
-      await bridge.newTopic("f", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       await bridge.handleMessage(t1, { text: "/file ../../etc/passwd" });
@@ -354,7 +396,7 @@ describe("Bridge", () => {
       const outsideFile = join(outsideDir, "secret.txt");
       await writeFile(outsideFile, "top secret");
       cfg.defaultCwd = cwd;
-      await bridge.newTopic("f", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       await bridge.handleMessage(t1, { text: `/file ${outsideFile}` });
@@ -376,7 +418,7 @@ describe("Bridge", () => {
       const siblingFile = join(siblingDir, "f");
       await writeFile(siblingFile, "nope");
       cfg.defaultCwd = cwd;
-      await bridge.newTopic("f", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       await bridge.handleMessage(t1, { text: `/file ${siblingFile}` });
@@ -392,7 +434,7 @@ describe("Bridge", () => {
       const filePath = join(cwd, "note.txt");
       await writeFile(filePath, "hello");
       cfg.defaultCwd = cwd;
-      await bridge.newTopic("f", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       await bridge.handleMessage(t1, { text: "/file note.txt" });
@@ -419,7 +461,7 @@ describe("Bridge", () => {
         return AgentSession.start({ ...opts, stream: clientStream, spawn: undefined });
       };
       const bridge = new Bridge(cfg, botApi, store, starter);
-      await bridge.newTopic("a", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       await bridge.handleMessage(t1, {
@@ -432,7 +474,7 @@ describe("Bridge", () => {
 
     it("sanitizes a '.'/'..' upload filename to a generated name", async () => {
       const { bridge, botApi, mocks } = makeBridge();
-      await bridge.newTopic("a", async () => {});
+      await bridge.newTopic(undefined, async () => {});
       const t1 = botApi.topics[0]!.threadId;
 
       botApi.files.set("doc1", { filePath: "server/path/doc1", fileSize: 5 });
@@ -449,6 +491,114 @@ describe("Bridge", () => {
       const absPath = savedLine.replace("Attached file saved at: ", "");
       expect(basename(absPath)).toMatch(/^upload-\d+$/);
       await expect(readFile(absPath, "utf-8")).resolves.toBe("hello");
+    });
+  });
+
+  describe("/sessions + attach", () => {
+    const SESSIONS: import("@agentclientprotocol/sdk").SessionInfo[] = [
+      {
+        sessionId: "sess_mock_1",
+        cwd: "/home/kiril/proj",
+        title: "Resume me please",
+        updatedAt: "2026-07-03T18:00:00.000Z",
+      },
+      {
+        sessionId: "other-id",
+        cwd: "/home/kiril/other",
+        title: "Another old session",
+        updatedAt: "2026-07-02T10:00:00.000Z",
+      },
+    ];
+    const REPLAY: import("@agentclientprotocol/sdk").SessionUpdate[] = [
+      { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old question" } },
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old answer" } },
+    ];
+
+    it("filters out already-attached ids from the listing", async () => {
+      const { bridge, botApi } = makeBridge((a) => {
+        a.listSessionsResponse = SESSIONS;
+      });
+      // Attach an existing topic whose acp id is sess_mock_1 (so it is filtered).
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/sessions" });
+
+      const listing = botApi.messages.find((m) => m.keyboard && /Resumable sessions/.test(m.html))!;
+      expect(listing).toBeDefined();
+      const buttons = listing.keyboard!.inline_keyboard;
+      // sess_mock_1 filtered out → only "other-id" remains.
+      expect(buttons).toHaveLength(1);
+      expect(listing.html).toContain("Another old session");
+      expect(listing.html).not.toContain("Resume me please");
+    });
+
+    it("attach:{k} creates a topic, streams the transcript, and persists a store entry", async () => {
+      const { bridge, botApi, store } = makeBridge((a) => {
+        a.listSessionsResponse = SESSIONS;
+        a.loadReplay = REPLAY;
+      });
+
+      // No existing topic → General /sessions uses a throwaway listing agent.
+      await bridge.handleMessage(undefined, { text: "/sessions" });
+      const listing = botApi.messages.find((m) => m.keyboard && /Resumable sessions/.test(m.html))!;
+      expect(listing).toBeDefined();
+      // Pick the button for the loadable session (sess_mock_1 = "Resume me please").
+      const idx = listing.html.indexOf("Resume me please");
+      const otherIdx = listing.html.indexOf("Another old session");
+      expect(idx).toBeGreaterThanOrEqual(0);
+      // Its button is the first row (most recent first).
+      const attachData = listing.keyboard!.inline_keyboard[0]![0]!.callback_data;
+      expect(attachData).toMatch(/^attach:\d+$/);
+      expect(attachData.length).toBeLessThanOrEqual(64);
+      void otherIdx;
+
+      const before = botApi.topics.length;
+      const res = await bridge.handleCallback(attachData, 1);
+      await tick();
+      expect(res?.toast).toBe("attached");
+      expect(botApi.topics.length).toBe(before + 1);
+      const attachedThread = botApi.topics.at(-1)!.threadId;
+      // Topic title = session title truncated (present) → "Resume me please".
+      expect(botApi.topics.at(-1)!.name).toBe("Resume me please");
+
+      // The transcript streams via a MessageDraft, whose final content lands in
+      // an editMessageText (sends carry only the leading-edge partial). Gather
+      // sends into this thread + all edits; the fully-rendered transcript is one
+      // html string containing both roles in order.
+      const sendHtml = botApi.messages
+        .filter((m) => m.threadId === attachedThread)
+        .map((m) => m.html);
+      const allHtml = [...sendHtml, ...botApi.edits.map((e) => e.html)];
+      const full = allHtml.find((h) => h.includes("old question") && h.includes("old answer"))!;
+      expect(full).toBeDefined();
+      expect(full).toContain("👤"); // user separator
+      expect(full.indexOf("old question")).toBeLessThan(full.indexOf("old answer"));
+      // The attached notice was sent into the thread.
+      expect(sendHtml.join("\n")).toContain("attached");
+
+      // Persisted like any topic.
+      const entry = store.get(attachedThread);
+      expect(entry?.acpSessionId).toBe("sess_mock_1");
+      expect(entry?.cwd).toBe("/home/kiril/proj");
+      expect(entry?.title).toBe("Resume me please");
+    });
+
+    it("a stale/unknown attach:{k} toasts and does not crash or create a topic", async () => {
+      const { bridge, botApi } = makeBridge();
+      const res = await bridge.handleCallback("attach:9999", 1);
+      expect(res?.toast).toMatch(/no longer listed/);
+      expect(botApi.topics).toHaveLength(0);
+    });
+
+    it("/sessions with no resumable sessions replies with a notice", async () => {
+      const { bridge, botApi } = makeBridge((a) => {
+        a.listSessionsResponse = [];
+      });
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+      await bridge.handleMessage(t1, { text: "/sessions" });
+      expect(botApi.htmlFor(t1).join("\n")).toContain("No resumable sessions");
     });
   });
 });
