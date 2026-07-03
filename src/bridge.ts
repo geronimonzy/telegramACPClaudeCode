@@ -1,0 +1,745 @@
+// Composition root: assembles every prior module into a working bot.
+//
+// The Bridge owns the Map<threadId, TopicSession>, one PermissionBroker and one
+// TerminalRegistry per process, and the single StateStore. It is
+// transport-agnostic: it talks to Telegram exclusively through the thin
+// {@link BotApi} interface (adapted to grammY in bot.ts, faked in tests), so
+// the whole command table, upload handling and callback routing are unit
+// testable without a real bot.
+//
+// Every user-facing string interpolated into a send goes through escapeHtml;
+// every message send carries a message_thread_id (via BotApi, whose adapter
+// threads it through). All logic lives here — bot.ts is a thin adapter.
+
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import * as path from "node:path";
+import type * as acp from "@agentclientprotocol/sdk";
+import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
+import { makeFsHandlers } from "./acp/fs-handlers.js";
+import { TerminalRegistry } from "./acp/terminals.js";
+import type { Config } from "./config.js";
+import { escapeHtml } from "./html.js";
+import { log } from "./log.js";
+import { StateStore, type SessionState } from "./state.js";
+import { TopicSession, type TopicUi } from "./orchestrator.js";
+import { PermissionBroker } from "./telegram/permissions.js";
+import type { MessageApi } from "./telegram/live-message.js";
+
+/** An inline keyboard, in Telegram's `inline_keyboard` shape. */
+export interface InlineKeyboard {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+}
+
+/**
+ * The thin slice of the grammY Api the Bridge depends on. The bot.ts adapter
+ * fills in `chat_id` (always `cfg.forumChatId`) and threads `message_thread_id`
+ * / HTML parse mode / disabled link previews through every send. Faked in tests.
+ */
+export interface BotApi {
+  /** Create a forum topic; resolves to its `message_thread_id`. */
+  createForumTopic(name: string, iconColor: number): Promise<number>;
+  /** Send an HTML message to a topic (`undefined` = General); resolves to its message id. */
+  sendMessage(
+    threadId: number | undefined,
+    html: string,
+    keyboard?: InlineKeyboard,
+  ): Promise<number>;
+  /** Edit a message's text (identified chat-globally by message id). */
+  editMessageText(messageId: number, html: string): Promise<void>;
+  /** Emit a chat action (typing heartbeat) for a topic. */
+  sendChatAction(threadId: number | undefined, action: string): Promise<void>;
+  /** Upload a local file as a document into a topic. */
+  sendDocument(threadId: number, filePath: string, caption?: string): Promise<void>;
+  /** Look up a Telegram file's server path + size by file id. */
+  getFile(fileId: string): Promise<{ filePath?: string; fileSize?: number }>;
+  /** Download a Telegram file (by server path) into memory. */
+  downloadFile(filePath: string): Promise<Buffer>;
+  /** Pin a message in a topic. */
+  pinChatMessage(threadId: number | undefined, messageId: number): Promise<void>;
+  /** Register the bot's command list (adapter scopes it to the forum chat). */
+  setMyCommands(commands: Array<{ command: string; description: string }>): Promise<void>;
+  /** Close a forum topic. */
+  closeForumTopic(threadId: number): Promise<void>;
+}
+
+/** How the Bridge starts an AgentSession; overridden in tests to inject a stream. */
+export type AgentStarter = (opts: AgentSessionOptions) => Promise<AgentSession>;
+
+/** An inbound Telegram message, normalized by the bot.ts adapter. */
+export interface IncomingMsg {
+  text?: string;
+  caption?: string;
+  photo?: { fileId: string; fileSize?: number };
+  document?: { fileId: string; fileName: string; fileSize?: number; mimeType?: string };
+}
+
+/** The six forum-topic icon colors Telegram permits, cycled by `/new`. */
+const ICON_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
+
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const TELEGRAM_MSG_LIMIT = 4000;
+
+/** The command list registered with Telegram (BotCommandScopeChat in bot.ts). */
+export const COMMAND_LIST: Array<{ command: string; description: string }> = [
+  { command: "new", description: "Start a new session topic" },
+  { command: "end", description: "End this session and close the topic" },
+  { command: "cancel", description: "Cancel the in-flight turn" },
+  { command: "mode", description: "Choose the agent mode" },
+  { command: "yolo", description: "Toggle bypass-permissions mode" },
+  { command: "status", description: "Show session status" },
+  { command: "commands", description: "List agent-supported commands" },
+  { command: "cwd", description: "Show the session working directory" },
+  { command: "file", description: "Send a file from the session cwd" },
+];
+
+const UNKNOWN_COMMAND =
+  "Unknown command — /commands lists what the agent supports.";
+const NO_SESSION =
+  "No active session in this topic — /new to start one.";
+
+/**
+ * Parse a leading slash command; returns undefined for non-commands.
+ *
+ * ANY trimmed text starting with `/` is treated as a command attempt — never
+ * falls through to a raw prompt forward. The name capture is intentionally
+ * broad (`[^\s@]+`, not just `[A-Za-z0-9_:]+`) so hyphenated/unusual agent
+ * command names (`/pr-comments`, `/frobnicate-now`) are recognized as commands
+ * and run through the known/unknown decision, rather than slipping past the
+ * regex and being forwarded to the agent as an ordinary prompt. In the rare
+ * case the body doesn't match at all (e.g. `/` followed immediately by
+ * whitespace), we still return a (deliberately unmatchable) command so the
+ * caller's unknown-command path — not the prompt path — handles it.
+ */
+function parseCommand(text: string): { cmd: string; args: string } | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return undefined;
+  const m = /^\/([^\s@]+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (!m) return { cmd: "", args: "" };
+  return { cmd: m[1]!, args: (m[2] ?? "").trim() };
+}
+
+/** Best-effort image MIME type from a Telegram file path (photos are JPEG). */
+function imageMime(filePath: string | undefined): string {
+  const ext = (filePath ?? "").toLowerCase();
+  if (ext.endsWith(".png")) return "image/png";
+  if (ext.endsWith(".webp")) return "image/webp";
+  if (ext.endsWith(".gif")) return "image/gif";
+  return "image/jpeg";
+}
+
+/** Split text into chunks no longer than `limit`, breaking on line boundaries. */
+function chunk(text: string, limit: number): string[] {
+  const out: string[] = [];
+  let cur = "";
+  for (const line of text.split("\n")) {
+    if (cur.length + line.length + 1 > limit && cur.length > 0) {
+      out.push(cur);
+      cur = "";
+    }
+    cur = cur ? `${cur}\n${line}` : line;
+  }
+  if (cur) out.push(cur);
+  return out.length ? out : [text];
+}
+
+function logError(context: string, e: unknown): void {
+  log.error({ err: e }, `[bridge] ${context}`);
+}
+
+export class Bridge {
+  readonly #cfg: Config;
+  readonly #botApi: BotApi;
+  readonly #store: StateStore;
+  readonly #startAgent: AgentStarter;
+
+  readonly #broker = new PermissionBroker();
+  readonly #terminals = new TerminalRegistry();
+  readonly #sessions = new Map<number, TopicSession>();
+
+  #seq = 0;
+
+  constructor(
+    cfg: Config,
+    botApi: BotApi,
+    store: StateStore,
+    startAgent: AgentStarter = AgentSession.start,
+  ) {
+    this.#cfg = cfg;
+    this.#botApi = botApi;
+    this.#store = store;
+    this.#startAgent = startAgent;
+  }
+
+  /**
+   * Load persisted state and reattach every stored session. A stored id the
+   * agent no longer knows falls back to a fresh session (with a notice); a hard
+   * start failure notifies the topic and drops it from the store.
+   */
+  async init(): Promise<void> {
+    await this.#store.load();
+    const stored = this.#store.list();
+    this.#seq = stored.length;
+    for (const s of stored) {
+      try {
+        const session = await this.#spawnTopic(s.threadId, s.cwd, s.acpSessionId);
+        const agent = session.agentSession;
+        if (agent.loaded) {
+          await this.#send(s.threadId, `🔄 <b>${escapeHtml(s.title)}</b> — session restored.`);
+        } else {
+          // loadSession failed; AgentSession fell back to a fresh session.
+          await this.#store.upsert({ ...s, acpSessionId: agent.sessionId });
+          await this.#send(
+            s.threadId,
+            `⚠️ <b>${escapeHtml(s.title)}</b> — previous session could not be restored; started fresh.`,
+          );
+        }
+      } catch (e) {
+        logError(`reattach failed for thread ${s.threadId}`, e);
+        await this.#store.remove(s.threadId);
+        await this.#send(
+          s.threadId,
+          `💥 <b>${escapeHtml(s.title)}</b> — could not restart the agent. Use /new to start again or tap Restart.`,
+          this.#restartKeyboard(s.threadId),
+        );
+      }
+    }
+    await this.#botApi.setMyCommands(COMMAND_LIST).catch((e) => logError("setMyCommands", e));
+  }
+
+  /**
+   * Create a new forum topic + agent session. `reply` targets whichever topic
+   * the `/new` was issued from (General or a session topic); the substantive
+   * intro is sent into the newly created topic.
+   */
+  async newTopic(
+    name: string | undefined,
+    reply: (html: string) => Promise<void>,
+  ): Promise<void> {
+    const n = ++this.#seq;
+    const title = name && name.length > 0 ? name : `claude-${n}`;
+    const iconColor = ICON_COLORS[(n - 1) % ICON_COLORS.length]!;
+    const cwd = (name ? this.#cfg.projects[name] : undefined) ?? this.#cfg.defaultCwd;
+
+    let threadId: number;
+    try {
+      threadId = await this.#botApi.createForumTopic(title, iconColor);
+    } catch (e) {
+      logError("createForumTopic failed", e);
+      await reply("⚠️ could not create the topic — check the bot's admin rights.");
+      return;
+    }
+
+    let session: TopicSession;
+    try {
+      session = await this.#spawnTopic(threadId, cwd, undefined);
+    } catch (e) {
+      logError("newTopic agent start failed", e);
+      await this.#send(threadId, "💥 could not start the agent — /new to retry.");
+      return;
+    }
+
+    const agent = session.agentSession;
+    await this.#store.upsert({
+      threadId,
+      acpSessionId: agent.sessionId,
+      cwd,
+      title,
+      createdAt: new Date().toISOString(),
+    });
+    let introId: number | undefined;
+    try {
+      introId = await this.#botApi.sendMessage(
+        threadId,
+        `🆕 <b>${escapeHtml(title)}</b>\n` +
+          `cwd: <code>${escapeHtml(cwd)}</code>\n` +
+          `mode: ${escapeHtml(agent.currentModeId ?? "default")}\n` +
+          `/commands for the commands this agent supports`,
+      );
+    } catch (e) {
+      logError("send failed", e);
+    }
+    // Pin the intro so the session's key context stays reachable; a missing
+    // can_pin_messages right (or any pin failure) must not fail /new.
+    if (introId !== undefined) {
+      await this.#botApi
+        .pinChatMessage(threadId, introId)
+        .catch((e) => logError("pinChatMessage failed", e));
+    }
+    await reply(`🆕 Created <b>${escapeHtml(title)}</b>.`);
+  }
+
+  /**
+   * Route one inbound message. `threadId === undefined` is the General topic
+   * (only `/new` is accepted there); a session topic dispatches the full command
+   * table, uploads and plain-text prompts.
+   */
+  async handleMessage(threadId: number | undefined, msg: IncomingMsg): Promise<void> {
+    if (threadId === undefined) {
+      await this.#handleGeneral(msg);
+      return;
+    }
+
+    const cmd = msg.text ? parseCommand(msg.text) : undefined;
+
+    // `/new` works from any topic (creates a *new* one).
+    if (cmd?.cmd === "new") {
+      await this.newTopic(cmd.args || undefined, (h) => this.#send(threadId, h));
+      return;
+    }
+
+    const session = this.#sessions.get(threadId);
+    if (!session) {
+      await this.#send(threadId, NO_SESSION);
+      return;
+    }
+
+    if (cmd) {
+      await this.#dispatchCommand(threadId, session, cmd.cmd, cmd.args, msg.text!);
+      return;
+    }
+
+    await this.#handlePrompt(threadId, session, msg);
+  }
+
+  /**
+   * Route a callback query. `callbackMessageId` is the message the tapped
+   * keyboard is attached to (used as the fallback edit target for a permission
+   * decision whose prompt id the broker never learned). Returns the toast text.
+   */
+  async handleCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string } | undefined> {
+    if (data.startsWith("perm:")) return this.#handlePermCallback(data, callbackMessageId);
+    if (data.startsWith("mode:")) return this.#handleModeCallback(data, callbackMessageId);
+    if (data.startsWith("restart:")) return this.#handleRestartCallback(data);
+    return undefined;
+  }
+
+  /** Dispose every session + agent, kill terminals. Store is persisted eagerly. */
+  async shutdown(): Promise<void> {
+    for (const session of this.#sessions.values()) {
+      try {
+        await session.dispose();
+        await session.agentSession.dispose();
+      } catch (e) {
+        logError("shutdown dispose failed", e);
+      }
+    }
+    this.#sessions.clear();
+    this.#terminals.disposeAll();
+  }
+
+  // --- command dispatch ----------------------------------------------------
+
+  async #dispatchCommand(
+    threadId: number,
+    session: TopicSession,
+    cmd: string,
+    args: string,
+    rawText: string,
+  ): Promise<void> {
+    const agent = session.agentSession;
+    switch (cmd) {
+      case "end":
+        await this.#endTopic(threadId, session);
+        return;
+      case "cancel":
+        await session.cancel();
+        await this.#send(threadId, "⏹ cancelling the current turn…");
+        return;
+      case "mode":
+        await this.#send(threadId, "Choose a mode:", this.#modeKeyboard(threadId, agent));
+        return;
+      case "yolo":
+        await this.#yolo(threadId, agent);
+        return;
+      case "status":
+        await this.#send(threadId, this.#statusText(threadId, session));
+        return;
+      case "commands":
+        await this.#sendCommands(threadId, agent);
+        return;
+      case "cwd": {
+        const cwd = this.#store.get(threadId)?.cwd ?? this.#cfg.defaultCwd;
+        await this.#send(threadId, `cwd: <code>${escapeHtml(cwd)}</code>`);
+        return;
+      }
+      case "file":
+        await this.#sendFile(threadId, args);
+        return;
+      default:
+        await this.#dispatchAgentCommand(threadId, session, cmd, rawText);
+    }
+  }
+
+  /** A non-builtin slash command: forward verbatim if the agent knows it, else refuse. */
+  async #dispatchAgentCommand(
+    threadId: number,
+    session: TopicSession,
+    cmd: string,
+    rawText: string,
+  ): Promise<void> {
+    const known = session.agentSession.availableCommands.some(
+      (c) => c.name === cmd || c.name === `mcp:${cmd}`,
+    );
+    if (!known) {
+      await this.#send(threadId, UNKNOWN_COMMAND);
+      return;
+    }
+    // The verbatim `/xyz args` text IS the ACP command invocation mechanism.
+    await session.handleUserPrompt([{ type: "text", text: rawText.trim() }]);
+  }
+
+  async #endTopic(threadId: number, session: TopicSession): Promise<void> {
+    this.#sessions.delete(threadId);
+    this.#terminals.releaseForSession(session.agentSession.sessionId);
+    try {
+      await session.dispose();
+      await session.agentSession.dispose();
+    } catch (e) {
+      logError("end dispose failed", e);
+    }
+    await this.#store.remove(threadId);
+    // Best-effort cleanup of this topic's saved uploads; failure must not fail /end.
+    await rm(path.join(this.#cfg.dataDir, "uploads", String(threadId)), {
+      recursive: true,
+      force: true,
+    }).catch((e) => logError("uploads cleanup failed", e));
+    await this.#botApi.closeForumTopic(threadId).catch((e) => logError("closeForumTopic", e));
+  }
+
+  async #yolo(threadId: number, agent: AgentSession): Promise<void> {
+    const modes = agent.availableModes();
+    let target: string;
+    if (agent.currentModeId === "bypassPermissions") {
+      target = "default";
+    } else if (modes.some((m) => m.id === "bypassPermissions")) {
+      target = "bypassPermissions";
+    } else {
+      target = "dontAsk";
+    }
+    try {
+      await agent.setMode(target);
+    } catch (e) {
+      logError("yolo setMode failed", e);
+      await this.#send(threadId, "⚠️ could not switch mode.");
+      return;
+    }
+    const name = modes.find((m) => m.id === (agent.currentModeId ?? target))?.name ?? target;
+    await this.#send(threadId, `Mode: <b>${escapeHtml(name)}</b>`);
+  }
+
+  #statusText(threadId: number, session: TopicSession): string {
+    const agent = session.agentSession;
+    const stored = this.#store.get(threadId);
+    const lines = [
+      `📊 <b>Status</b>`,
+      `session: <code>${escapeHtml(agent.sessionId.slice(0, 8))}</code>`,
+      `cwd: <code>${escapeHtml(stored?.cwd ?? this.#cfg.defaultCwd)}</code>`,
+      `mode: ${escapeHtml(agent.currentModeId ?? "default")}`,
+    ];
+    const u = session.lastUsage;
+    if (u) {
+      let usage = `usage: ${u.used}/${u.size} tokens`;
+      if (u.cost) usage += ` · cost ${u.cost.amount} ${escapeHtml(u.cost.currency)}`;
+      lines.push(usage);
+    }
+    return lines.join("\n");
+  }
+
+  async #sendCommands(threadId: number, agent: AgentSession): Promise<void> {
+    const cmds = agent.availableCommands;
+    if (cmds.length === 0) {
+      await this.#send(threadId, "This agent advertises no commands.");
+      return;
+    }
+    const body = cmds
+      .map((c) => `/${escapeHtml(c.name)} — ${escapeHtml(c.description)}`)
+      .join("\n");
+    for (const part of chunk(body, TELEGRAM_MSG_LIMIT)) {
+      await this.#send(threadId, part);
+    }
+  }
+
+  async #sendFile(threadId: number, arg: string): Promise<void> {
+    if (!arg) {
+      await this.#send(threadId, "Usage: /file &lt;path&gt;");
+      return;
+    }
+    const base = this.#store.get(threadId)?.cwd ?? this.#cfg.defaultCwd;
+    const resolved = path.resolve(base, arg);
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+      await this.#send(threadId, "⚠️ path escapes the session directory.");
+      return;
+    }
+    let size: number;
+    try {
+      const st = await stat(resolved);
+      if (!st.isFile()) {
+        await this.#send(threadId, "⚠️ not a regular file.");
+        return;
+      }
+      size = st.size;
+    } catch {
+      await this.#send(threadId, `⚠️ no such file: <code>${escapeHtml(arg)}</code>`);
+      return;
+    }
+    if (size > MAX_FILE_BYTES) {
+      await this.#send(threadId, "⚠️ file is larger than 50 MB.");
+      return;
+    }
+    try {
+      await this.#botApi.sendDocument(threadId, resolved);
+    } catch (e) {
+      logError("sendDocument failed", e);
+      await this.#send(threadId, "⚠️ could not send the file.");
+    }
+  }
+
+  // --- prompts + uploads ---------------------------------------------------
+
+  async #handlePrompt(
+    threadId: number,
+    session: TopicSession,
+    msg: IncomingMsg,
+  ): Promise<void> {
+    let blocks: acp.ContentBlock[];
+    try {
+      blocks = await this.#buildBlocks(threadId, msg);
+    } catch (e) {
+      logError("upload handling failed", e);
+      await this.#send(threadId, "⚠️ could not process the attachment.");
+      return;
+    }
+    if (blocks.length === 0) return;
+    await session.handleUserPrompt(blocks);
+  }
+
+  async #buildBlocks(threadId: number, msg: IncomingMsg): Promise<acp.ContentBlock[]> {
+    const blocks: acp.ContentBlock[] = [];
+
+    if (msg.photo) {
+      const file = await this.#botApi.getFile(msg.photo.fileId);
+      const size = file.fileSize ?? msg.photo.fileSize ?? 0;
+      if (size > MAX_UPLOAD_BYTES) {
+        await this.#send(threadId, "⚠️ photo is larger than 20 MB — skipped.");
+      } else if (file.filePath) {
+        const buf = await this.#botApi.downloadFile(file.filePath);
+        blocks.push({
+          type: "image",
+          data: buf.toString("base64"),
+          mimeType: imageMime(file.filePath),
+        });
+      }
+      if (msg.caption) blocks.push({ type: "text", text: msg.caption });
+      return blocks;
+    }
+
+    if (msg.document) {
+      // Check the size Telegram already told us BEFORE calling getFile, so an
+      // oversized upload is refused without an extra round trip (mirrors the
+      // cap photos are held to).
+      if ((msg.document.fileSize ?? 0) > MAX_UPLOAD_BYTES) {
+        await this.#send(threadId, "⚠️ file is larger than 20 MB — skipped.");
+        return blocks;
+      }
+      const file = await this.#botApi.getFile(msg.document.fileId);
+      if (file.filePath) {
+        const buf = await this.#botApi.downloadFile(file.filePath);
+        const dir = path.join(this.#cfg.dataDir, "uploads", String(threadId));
+        await mkdir(dir, { recursive: true });
+        const rawBase = path.basename(msg.document.fileName);
+        // `.` / `..` (and an empty basename) would otherwise resolve to the
+        // uploads dir itself or its parent once joined — reject those and
+        // fall back to a generated name instead of writing outside the
+        // per-thread upload directory.
+        const safeBase =
+          rawBase === "" || rawBase === "." || rawBase === ".."
+            ? `upload-${Date.now()}`
+            : rawBase;
+        const absPath = path.join(dir, safeBase);
+        await writeFile(absPath, buf);
+        if (msg.caption) blocks.push({ type: "text", text: msg.caption });
+        blocks.push({ type: "text", text: `Attached file saved at: ${absPath}` });
+        blocks.push({
+          type: "resource_link",
+          uri: `file://${absPath}`,
+          name: msg.document.fileName,
+          ...(msg.document.mimeType ? { mimeType: msg.document.mimeType } : {}),
+        });
+      }
+      return blocks;
+    }
+
+    if (msg.text) blocks.push({ type: "text", text: msg.text });
+    return blocks;
+  }
+
+  // --- callbacks -----------------------------------------------------------
+
+  async #handlePermCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string }> {
+    const r = this.#broker.resolve(data);
+    if (!r) return { toast: "" };
+    // When the broker never learned the prompt's message id (a fast tap beat
+    // the send), the orchestrator can't reflect the decision — fall back to the
+    // callback query's own message id here.
+    if (r.messageId === undefined && callbackMessageId !== undefined) {
+      await this.#botApi
+        .editMessageText(callbackMessageId, `➡️ ${escapeHtml(r.label)}`)
+        .catch((e) => logError("perm fallback edit failed", e));
+    }
+    return { toast: r.label };
+  }
+
+  async #handleModeCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string }> {
+    const m = /^mode:(\d+):(.+)$/.exec(data);
+    if (!m) return { toast: "" };
+    const threadId = Number(m[1]);
+    const modeId = m[2]!;
+    const session = this.#sessions.get(threadId);
+    if (!session) return { toast: "no session" };
+    try {
+      await session.agentSession.setMode(modeId);
+    } catch (e) {
+      logError("mode callback setMode failed", e);
+      return { toast: "failed" };
+    }
+    const name =
+      session.agentSession.availableModes().find((x) => x.id === modeId)?.name ?? modeId;
+    if (callbackMessageId !== undefined) {
+      await this.#botApi
+        .editMessageText(callbackMessageId, `Mode: <b>${escapeHtml(name)}</b>`)
+        .catch((e) => logError("mode edit failed", e));
+    }
+    return { toast: `Mode: ${name}` };
+  }
+
+  async #handleRestartCallback(data: string): Promise<{ toast: string }> {
+    const threadId = Number(data.slice("restart:".length));
+    const stored = this.#store.get(threadId);
+    if (!stored) return { toast: "no session" };
+
+    const existing = this.#sessions.get(threadId);
+    if (existing) {
+      this.#sessions.delete(threadId);
+      this.#terminals.releaseForSession(existing.agentSession.sessionId);
+      try {
+        await existing.dispose();
+        await existing.agentSession.dispose();
+      } catch (e) {
+        logError("restart dispose failed", e);
+      }
+    } else {
+      this.#terminals.releaseForSession(stored.acpSessionId);
+    }
+
+    try {
+      const session = await this.#spawnTopic(threadId, stored.cwd, stored.acpSessionId);
+      await this.#store.upsert({ ...stored, acpSessionId: session.agentSession.sessionId });
+      await this.#send(threadId, "🔄 agent restarted.");
+      return { toast: "restarted" };
+    } catch (e) {
+      logError("restart failed", e);
+      await this.#store.remove(threadId);
+      await this.#send(threadId, "💥 restart failed — /new to start again.");
+      return { toast: "restart failed" };
+    }
+  }
+
+  // --- helpers -------------------------------------------------------------
+
+  async #handleGeneral(msg: IncomingMsg): Promise<void> {
+    const cmd = msg.text ? parseCommand(msg.text) : undefined;
+    if (cmd?.cmd === "new") {
+      await this.newTopic(cmd.args || undefined, (h) => this.#send(undefined, h));
+      return;
+    }
+    await this.#send(
+      undefined,
+      "This is the General topic. Use /new [name] to start a session; per-session commands run inside a session's own topic.",
+    );
+  }
+
+  #restartKeyboard(threadId: number): InlineKeyboard {
+    return { inline_keyboard: [[{ text: "🔄 Restart", callback_data: `restart:${threadId}` }]] };
+  }
+
+  #modeKeyboard(threadId: number, agent: AgentSession): InlineKeyboard {
+    return {
+      inline_keyboard: agent
+        .availableModes()
+        .map((m) => [{ text: m.name, callback_data: `mode:${threadId}:${m.id}` }]),
+    };
+  }
+
+  /** Start an AgentSession wired to a fresh TopicSession for `threadId`. */
+  async #spawnTopic(
+    threadId: number,
+    cwd: string,
+    loadSessionId: string | undefined,
+  ): Promise<TopicSession> {
+    const ui = this.#makeUi(threadId);
+    let session: TopicSession | undefined;
+    const agent = await this.#startAgent({
+      cwd,
+      loadSessionId,
+      spawn: { command: this.#cfg.adapterCommand, env: this.#cfg.adapterEnv },
+      client: { ...makeFsHandlers(), ...this.#terminals.handlers() },
+      onUpdate: (u) => session?.handleUpdate(u),
+      onPermission: (r) => session!.handlePermission(r),
+      onExit: (info) => session?.handleAgentExit(info),
+    });
+    session = new TopicSession({
+      agent,
+      ui,
+      broker: this.#broker,
+      threadId,
+      cfg: this.#cfg,
+    });
+    this.#sessions.set(threadId, session);
+    return session;
+  }
+
+  /** A TopicUi bound to one topic, backed by BotApi (every send carries the thread). */
+  #makeUi(threadId: number): TopicUi {
+    const botApi = this.#botApi;
+    return {
+      messageApi(): MessageApi {
+        return {
+          send: (html) => botApi.sendMessage(threadId, html),
+          edit: (messageId, html) => botApi.editMessageText(messageId, html),
+        };
+      },
+      typing(): void {
+        void botApi.sendChatAction(threadId, "typing").catch((e) => logError("typing", e));
+      },
+      async notify(html: string, keyboard?: InlineKeyboard): Promise<void> {
+        await botApi.sendMessage(threadId, html, keyboard);
+      },
+      async presentPermission(p): Promise<number> {
+        return botApi.sendMessage(threadId, p.html, { inline_keyboard: p.keyboard });
+      },
+      async editPermissionMessage(messageId: number, html: string): Promise<void> {
+        await botApi.editMessageText(messageId, html);
+      },
+    };
+  }
+
+  async #send(threadId: number | undefined, html: string, keyboard?: InlineKeyboard): Promise<void> {
+    try {
+      await this.#botApi.sendMessage(threadId, html, keyboard);
+    } catch (e) {
+      logError("send failed", e);
+    }
+  }
+}
+
+export type { SessionState };

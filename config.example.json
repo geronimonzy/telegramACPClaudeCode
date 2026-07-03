@@ -1,0 +1,34 @@
+{
+  "_comment_botToken": "Telegram bot token from @BotFather",
+  "botToken": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+
+  "_comment_forumChatId": "Telegram supergroup (forum) chat id the bridge posts topics into",
+  "forumChatId": -1001234567890,
+
+  "_comment_allowedUserIds": "Telegram user ids allowed to interact with the bridge",
+  "allowedUserIds": [42],
+
+  "_comment_defaultCwd": "Default working directory for new sessions when no project is specified",
+  "defaultCwd": "/home/user/projects",
+
+  "_comment_projects": "Named shortcuts mapping a project name to a working directory",
+  "projects": {},
+
+  "_comment_editIntervalMs": "Minimum interval between message edits while streaming a response (default 1500)",
+  "editIntervalMs": 1500,
+
+  "_comment_typingIntervalMs": "Interval for refreshing the 'typing...' indicator (default 4500)",
+  "typingIntervalMs": 4500,
+
+  "_comment_showThoughts": "Whether to forward the agent's thinking/reasoning blocks to Telegram (default false)",
+  "showThoughts": false,
+
+  "_comment_adapterCommand": "Command used to spawn the ACP adapter process (default [\"npx\", \"-y\", \"claude-agent-acp\"])",
+  "adapterCommand": ["npx", "-y", "claude-agent-acp"],
+
+  "_comment_adapterEnv": "Extra environment variables passed to the adapter process",
+  "adapterEnv": {},
+
+  "_comment_dataDir": "Directory used to persist bridge state (default ~/.local/share/telegram-acp-bridge)",
+  "dataDir": "~/.local/share/telegram-acp-bridge"
+}
