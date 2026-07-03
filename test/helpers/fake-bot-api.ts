@@ -43,6 +43,22 @@ export class FakeBotApi implements BotApi {
     this.edits.push({ messageId, html });
   }
 
+  // Rich Messages share the same recording arrays as their plain counterparts so
+  // existing content assertions apply regardless of dialect.
+  async sendRich(
+    threadId: number | undefined,
+    html: string,
+    keyboard?: InlineKeyboard,
+  ): Promise<number> {
+    const messageId = this.#nextMessageId++;
+    this.messages.push({ threadId, html, keyboard, messageId });
+    return messageId;
+  }
+
+  async editRich(messageId: number, html: string): Promise<void> {
+    this.edits.push({ messageId, html });
+  }
+
   async sendChatAction(threadId: number | undefined, action: string): Promise<void> {
     this.chatActions.push({ threadId, action });
   }

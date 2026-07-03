@@ -6,6 +6,24 @@ import { FakeApi } from "./helpers/fake-api.js";
 
 const INTERVAL = 1000;
 
+// Void-aware balance checker: Rich Messages 400 on unbalanced markup.
+const VOID_TAGS = new Set(["br", "hr", "img", "input"]);
+function isBalanced(html: string): boolean {
+  const tagRe = /<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g;
+  const stack: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html))) {
+    const full = m[0];
+    const name = m[1].toLowerCase();
+    if (full.startsWith("</")) {
+      if (stack.pop() !== name) return false;
+    } else if (!full.endsWith("/>") && !VOID_TAGS.has(name)) {
+      stack.push(name);
+    }
+  }
+  return stack.length === 0;
+}
+
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
@@ -30,8 +48,12 @@ function toolCallUpdate(
   };
 }
 
-describe("ActivityRenderer", () => {
-  it("renders header + status/kind/title for a tool_call", async () => {
+function latest(api: FakeApi): string {
+  return api.edits.length > 0 ? api.edits[api.edits.length - 1][1] : api.sends[api.sends.length - 1];
+}
+
+describe("ActivityRenderer (Rich)", () => {
+  it("renders a collapsible details panel with a counter summary and a row per tool_call", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);
     const r = new ActivityRenderer(live);
@@ -39,10 +61,15 @@ describe("ActivityRenderer", () => {
     await live.flushNow();
     expect(api.sends).toHaveLength(1);
     const html = api.sends[0];
-    expect(html).toContain("<b>Activity</b>");
+    expect(html.startsWith("<details open><summary>")).toBe(true);
+    expect(html).toContain("⚙️ Activity — 1 call · 1 running");
+    expect(html).toContain("<ul>");
+    expect(html).toContain("<li>");
     expect(html).toContain("🔄");
     expect(html).toContain("📖");
     expect(html).toContain("<b>Reading foo.ts</b>");
+    expect(html.endsWith("</details>")).toBe(true);
+    expect(isBalanced(html)).toBe(true);
   });
 
   it("update merges by toolCallId and keeps title on null (status → completed ✅)", async () => {
@@ -52,10 +79,12 @@ describe("ActivityRenderer", () => {
     r.onToolCall(toolCall({ toolCallId: "42", title: "Editing bar.ts", kind: "edit", status: "in_progress" }));
     r.onToolCallUpdate(toolCallUpdate({ toolCallId: "42", status: "completed", title: null }));
     await live.flushNow();
-    const html = api.edits.length > 0 ? api.edits[api.edits.length - 1][1] : api.sends[api.sends.length - 1];
+    const html = latest(api);
     expect(html).toContain("✅");
     expect(html).toContain("<b>Editing bar.ts</b>");
     expect(html).not.toContain("🔄");
+    expect(html).toContain("⚙️ Activity — 1 call"); // no running count once completed
+    expect(html).not.toContain("running");
   });
 
   it("tool_call_update with unknown toolCallId creates the row", async () => {
@@ -81,7 +110,7 @@ describe("ActivityRenderer", () => {
     expect(api.sends[0]).toContain("⏳");
   });
 
-  it("a diff content item appends a <pre> block truncated at 600 chars", async () => {
+  it("a diff content item appends a <pre><code> block truncated at 600 chars", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);
     const r = new ActivityRenderer(live);
@@ -96,15 +125,16 @@ describe("ActivityRenderer", () => {
     );
     await live.flushNow();
     const html = api.sends[0];
-    expect(html).toContain("<pre>");
-    const preMatch = /<pre>([\s\S]*?)<\/pre>/.exec(html);
+    expect(html).toContain("<pre><code>");
+    const preMatch = /<pre><code>([\s\S]*?)<\/code><\/pre>/.exec(html);
     expect(preMatch).not.toBeNull();
     const inner = preMatch![1];
     expect(inner.length).toBeLessThanOrEqual(601); // 600 chars + ellipsis
     expect(inner.endsWith("…")).toBe(true);
+    expect(isBalanced(html)).toBe(true);
   });
 
-  it("diff content is HTML-escaped", async () => {
+  it("diff content is Rich-escaped", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);
     const r = new ActivityRenderer(live);
@@ -129,7 +159,7 @@ describe("ActivityRenderer", () => {
     const r = new ActivityRenderer(live);
     r.onToolCall(toolCall({ toolCallId: "7", title: "Running command", kind: "execute", status: "in_progress" }));
     await r.finalizeTurn();
-    const html = api.edits.length > 0 ? api.edits[api.edits.length - 1][1] : api.sends[api.sends.length - 1];
+    const html = latest(api);
     expect(html).toContain("❌");
     expect(html).not.toContain("🔄");
   });
@@ -142,5 +172,16 @@ describe("ActivityRenderer", () => {
     await r.finalizeTurn();
     const html = api.sends[api.sends.length - 1];
     expect(html).toContain("✅");
+  });
+
+  it("the running counter reflects multiple concurrent calls", async () => {
+    const api = new FakeApi();
+    const live = new LiveMessage(api, INTERVAL);
+    const r = new ActivityRenderer(live);
+    r.onToolCall(toolCall({ toolCallId: "a", status: "in_progress" }));
+    r.onToolCall(toolCall({ toolCallId: "b", status: "in_progress" }));
+    r.onToolCall(toolCall({ toolCallId: "c", status: "completed" }));
+    await live.flushNow();
+    expect(latest(api)).toContain("⚙️ Activity — 3 calls · 2 running");
   });
 });

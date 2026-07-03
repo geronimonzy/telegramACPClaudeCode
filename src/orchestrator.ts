@@ -30,6 +30,7 @@ import { escapeHtml } from "./html.js";
 import { log } from "./log.js";
 import { MessageDraft } from "./telegram/draft.js";
 import { LiveMessage, type MessageApi } from "./telegram/live-message.js";
+import { mdToRichHtml, RICH_MAX_LEN } from "./telegram/rich-html.js";
 import { ActivityRenderer } from "./telegram/activity.js";
 import { PlanRenderer } from "./telegram/plan.js";
 import type { PermissionBroker, PermissionPrompt } from "./telegram/permissions.js";
@@ -269,6 +270,8 @@ export class TopicSession {
     this.#cancelledTurn = false;
     this.#draft = new MessageDraft(this.#ui.messageApi(), {
       intervalMs: this.#cfg.editIntervalMs,
+      maxLen: RICH_MAX_LEN,
+      render: mdToRichHtml,
     });
     this.#activity = undefined;
     this.#plan = undefined;
@@ -312,7 +315,7 @@ export class TopicSession {
   #activityRenderer(): ActivityRenderer {
     if (!this.#activity) {
       this.#activity = new ActivityRenderer(
-        new LiveMessage(this.#ui.messageApi(), this.#cfg.editIntervalMs),
+        new LiveMessage(this.#ui.messageApi(), this.#cfg.editIntervalMs, RICH_MAX_LEN),
       );
     }
     return this.#activity;
@@ -321,7 +324,7 @@ export class TopicSession {
   #planRenderer(): PlanRenderer {
     if (!this.#plan) {
       this.#plan = new PlanRenderer(
-        new LiveMessage(this.#ui.messageApi(), this.#cfg.editIntervalMs),
+        new LiveMessage(this.#ui.messageApi(), this.#cfg.editIntervalMs, RICH_MAX_LEN),
       );
     }
     return this.#plan;

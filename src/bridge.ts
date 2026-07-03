@@ -24,6 +24,7 @@ import { log } from "./log.js";
 import { StateStore, type SessionState } from "./state.js";
 import { TopicSession, type TopicUi } from "./orchestrator.js";
 import { MessageDraft } from "./telegram/draft.js";
+import { mdToRichHtml, RICH_MAX_LEN } from "./telegram/rich-html.js";
 import { randomName } from "./telegram/names.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import type { MessageApi } from "./telegram/live-message.js";
@@ -49,6 +50,14 @@ export interface BotApi {
   ): Promise<number>;
   /** Edit a message's text (identified chat-globally by message id). */
   editMessageText(messageId: number, html: string): Promise<void>;
+  /** Send a Rich Message (Bot API 10.1) to a topic (`undefined` = General); resolves to its message id. */
+  sendRich(
+    threadId: number | undefined,
+    html: string,
+    keyboard?: InlineKeyboard,
+  ): Promise<number>;
+  /** Edit a message in place with new Rich Message content. */
+  editRich(messageId: number, html: string): Promise<void>;
   /** Emit a chat action (typing heartbeat) for a topic. */
   sendChatAction(threadId: number | undefined, action: string): Promise<void>;
   /** Upload a local file as a document into a topic. */
@@ -850,6 +859,8 @@ export class Bridge {
     // separators. MessageDraft owns HTML conversion, rollover and throttling.
     const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
       intervalMs: this.#cfg.editIntervalMs,
+      maxLen: RICH_MAX_LEN,
+      render: mdToRichHtml,
     });
     let lastRole: "user" | "agent" | undefined;
     const onReplayChunk = (u: acp.SessionUpdate): void => {
@@ -961,9 +972,12 @@ export class Bridge {
     const botApi = this.#botApi;
     return {
       messageApi(): MessageApi {
+        // The three content surfaces (streaming reply, Activity, Plan) deliver
+        // Rich Messages; the plain-HTML surfaces (notify/permissions) below stay
+        // on sendMessage/editMessageText.
         return {
-          send: (html) => botApi.sendMessage(threadId, html),
-          edit: (messageId, html) => botApi.editMessageText(messageId, html),
+          send: (html) => botApi.sendRich(threadId, html),
+          edit: (messageId, html) => botApi.editRich(messageId, html),
         };
       },
       typing(): void {

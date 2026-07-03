@@ -46,6 +46,24 @@ function makeBotApi(bot: Bot, cfg: Config): BotApi {
     async editMessageText(messageId, html): Promise<void> {
       await bot.api.editMessageText(chatId, messageId, html, HTML);
     },
+    async sendRich(threadId, html, keyboard?: InlineKeyboard): Promise<number> {
+      // Low-level object form to sidestep grammY's positional-wrapper trap for
+      // sendRichMessage (see scripts/spike-rich.ts / rich-messages.md).
+      const m = await bot.api.raw.sendRichMessage({
+        chat_id: chatId,
+        message_thread_id: threadId,
+        rich_message: { html },
+        reply_markup: keyboard,
+      });
+      return m.message_id;
+    },
+    async editRich(messageId, html): Promise<void> {
+      await bot.api.raw.editMessageText({
+        chat_id: chatId,
+        message_id: messageId,
+        rich_message: { html },
+      });
+    },
     async sendChatAction(threadId, action): Promise<void> {
       await bot.api.sendChatAction(chatId, action as "typing", {
         message_thread_id: threadId,

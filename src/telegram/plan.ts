@@ -5,8 +5,11 @@
 // `live.set(...)` — no api calls or throttling of its own.
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { escapeHtml } from "../html.js";
 import type { LiveMessage } from "./live-message.js";
+import { escapeRich, fitDetailsList } from "./rich-html.js";
+
+/** Fit budget for the Plan panel body, kept under the LiveMessage rich budget. */
+const RICH_FIT_LEN = 30000;
 
 const STATUS_EMOJI: Record<acp.PlanEntryStatus, string> = {
   pending: "☐",
@@ -14,9 +17,10 @@ const STATUS_EMOJI: Record<acp.PlanEntryStatus, string> = {
   completed: "☑",
 };
 
+/** Render one plan entry as a self-contained Rich `<li>`. */
 function renderEntry(entry: acp.PlanEntry): string {
   const suffix = entry.priority === "high" ? " ‼️" : "";
-  return `${STATUS_EMOJI[entry.status]} ${escapeHtml(entry.content)}${suffix}`;
+  return `<li>${STATUS_EMOJI[entry.status]} ${escapeRich(entry.content)}${suffix}</li>`;
 }
 
 export class PlanRenderer {
@@ -34,7 +38,10 @@ export class PlanRenderer {
   }
 
   private render(): void {
-    const lines = ["<b>Plan</b>", ...this.entries.map(renderEntry)];
-    this.live.set(lines.join("\n"));
+    const done = this.entries.filter((e) => e.status === "completed").length;
+    const total = this.entries.length;
+    const summary = `📋 Plan — ${done}/${total} done`;
+    const rows = this.entries.map(renderEntry);
+    this.live.set(fitDetailsList({ summary, rows, max: RICH_FIT_LEN, open: true }));
   }
 }

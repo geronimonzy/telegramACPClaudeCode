@@ -10,8 +10,11 @@
 // no api calls or throttling of its own (LiveMessage/Throttle own that).
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { escapeHtml } from "../html.js";
 import type { LiveMessage } from "./live-message.js";
+import { escapeRich, fitDetailsList } from "./rich-html.js";
+
+/** Fit budget for the Activity panel body, kept under the LiveMessage rich budget. */
+const RICH_FIT_LEN = 30000;
 
 const STATUS_EMOJI: Record<acp.ToolCallStatus, string> = {
   pending: "⏳",
@@ -48,14 +51,15 @@ function truncateDiff(text: string): string {
   return text.slice(0, DIFF_MAX_LEN) + "…";
 }
 
+/** Render one tool-call row as a self-contained Rich `<li>` (diff → `<pre><code>`). */
 function renderRow(row: Row): string {
-  let line = `${STATUS_EMOJI[row.status]} ${KIND_EMOJI[row.kind]} <b>${escapeHtml(row.title)}</b>`;
+  let inner = `${STATUS_EMOJI[row.status]} ${KIND_EMOJI[row.kind]} <b>${escapeRich(row.title)}</b>`;
   for (const item of row.content) {
     if (item.type === "diff") {
-      line += `\n<pre>${escapeHtml(truncateDiff(item.newText))}</pre>`;
+      inner += `<pre><code>${escapeRich(truncateDiff(item.newText))}</code></pre>`;
     }
   }
-  return line;
+  return `<li>${inner}</li>`;
 }
 
 export class ActivityRenderer {
@@ -109,11 +113,17 @@ export class ActivityRenderer {
   }
 
   private render(): void {
-    const lines = ["<b>Activity</b>"];
+    const rows: string[] = [];
+    let running = 0;
     for (const id of this.order) {
       const row = this.rows.get(id);
-      if (row) lines.push(renderRow(row));
+      if (!row) continue;
+      if (row.status === "in_progress") running++;
+      rows.push(renderRow(row));
     }
-    this.live.set(lines.join("\n"));
+    const n = rows.length;
+    const summary =
+      `⚙️ Activity — ${n} call${n === 1 ? "" : "s"}` + (running > 0 ? ` · ${running} running` : "");
+    this.live.set(fitDetailsList({ summary, rows, max: RICH_FIT_LEN, open: true }));
   }
 }

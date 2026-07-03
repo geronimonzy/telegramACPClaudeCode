@@ -11,6 +11,15 @@ import { type MessageApi, Throttle } from "./live-message.js";
 
 const DEFAULT_MAX_LEN = 4000;
 
+/**
+ * Renders the raw-markdown buffer to the target HTML dialect. Fit measurement,
+ * finalized-prefix rendering and rollover all flow through this one function, so
+ * swapping it (plain {@link mdToTelegramHtml} → rich `mdToRichHtml`) migrates a
+ * draft's content dialect without touching the rollover control flow. The cut
+ * logic itself operates on the raw markdown and stays dialect-agnostic.
+ */
+export type RenderFn = (md: string) => string;
+
 /** A markdown table row: a line whose trimmed text begins with `|`. */
 function isTableRow(line: string): boolean {
   return line.trim().startsWith("|");
@@ -37,7 +46,12 @@ function isListItem(line: string): boolean {
  * drop below the floor or the table alone exceeds `maxLen`, in which case the
  * cut falls on a table *row* boundary (never mid-row).
  */
-export function chooseCut(buffer: string, best: number, maxLen: number): number {
+export function chooseCut(
+  buffer: string,
+  best: number,
+  maxLen: number,
+  render: RenderFn = mdToTelegramHtml,
+): number {
   const floor = maxLen * 0.5;
   const lines = buffer.split("\n");
   const lineStart: number[] = [];
@@ -50,7 +64,7 @@ export function chooseCut(buffer: string, best: number, maxLen: number): number 
   }
   const nlAfter = (i: number): number => lineStart[i] + lines[i].length;
   const insideFence = (idx: number): boolean => fenceState(buffer.slice(0, idx)) !== null;
-  const renderedLen = (idx: number): number => mdToTelegramHtml(buffer.slice(0, idx)).length;
+  const renderedLen = (idx: number): number => render(buffer.slice(0, idx)).length;
 
   // If a chosen newline falls in the middle of a table block, move the cut to
   // just before the table so the whole table rolls over — unless that drops
@@ -64,7 +78,7 @@ export function chooseCut(buffer: string, best: number, maxLen: number): number 
     while (e + 1 < lines.length && isTableRow(lines[e + 1])) e++;
     if (s >= 1) {
       const before = lineStart[s] - 1; // newline ending line s-1
-      const tableRendered = mdToTelegramHtml(lines.slice(s, e + 1).join("\n")).length;
+      const tableRendered = render(lines.slice(s, e + 1).join("\n")).length;
       if (before > 0 && renderedLen(before) >= floor && tableRendered <= maxLen) {
         return before;
       }
@@ -128,6 +142,7 @@ export function chooseCut(buffer: string, best: number, maxLen: number): number 
 export function splitForRollover(
   buffer: string,
   maxLen: number,
+  render: RenderFn = mdToTelegramHtml,
 ): { prefix: string; remainder: string } {
   // Binary search for the largest character count whose render still fits.
   // Render length is *not* monotone in raw length in general (closing a fence
@@ -142,7 +157,7 @@ export function splitForRollover(
   let best = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (mdToTelegramHtml(buffer.slice(0, mid)).length <= maxLen) {
+    if (render(buffer.slice(0, mid)).length <= maxLen) {
       best = mid;
       lo = mid + 1;
     } else {
@@ -152,7 +167,7 @@ export function splitForRollover(
   best = Math.max(best, 1); // always make progress, even if one char overflows
 
   // Choose a meaningful cut point (paragraph → table/list → any line → hard).
-  const cut = chooseCut(buffer, best, maxLen);
+  const cut = chooseCut(buffer, best, maxLen, render);
   let prefix: string;
   let remainder: string;
   if (buffer[cut] === "\n") {
@@ -180,10 +195,15 @@ export function splitForRollover(
 export class MessageDraft {
   private buffer = "";
   private readonly maxLen: number;
+  private readonly render: RenderFn;
   private readonly t: Throttle;
 
-  constructor(api: MessageApi, opts: { intervalMs: number; maxLen?: number }) {
+  constructor(
+    api: MessageApi,
+    opts: { intervalMs: number; maxLen?: number; render?: RenderFn },
+  ) {
     this.maxLen = opts.maxLen ?? DEFAULT_MAX_LEN;
+    this.render = opts.render ?? mdToTelegramHtml;
     this.t = new Throttle(api, opts.intervalMs, (t) => this.flushStep(t));
   }
 
@@ -206,22 +226,22 @@ export class MessageDraft {
    * when draining inside finalize, since a rollover re-marks the throttle dirty).
    */
   private async flushStep(t: Throttle): Promise<void> {
-    const rendered = mdToTelegramHtml(this.buffer);
+    const rendered = this.render(this.buffer);
     if (rendered.length <= this.maxLen) {
       await t.push(rendered, this.buffer);
       return;
     }
-    const { prefix, remainder } = splitForRollover(this.buffer, this.maxLen);
+    const { prefix, remainder } = splitForRollover(this.buffer, this.maxLen, this.render);
     if (remainder === "") {
       // The cut landed exactly on trailing content (e.g. a boundary newline)
       // that contributed nothing to the next message — there is nothing to
       // roll over. Deliver the prefix into the *current* message and don't
       // retarget, or the next flush would send an empty string to a brand-new
       // message id.
-      await t.push(mdToTelegramHtml(prefix), prefix);
+      await t.push(this.render(prefix), prefix);
       return;
     }
-    await t.push(mdToTelegramHtml(prefix), prefix); // finalize current message
+    await t.push(this.render(prefix), prefix); // finalize current message
     // Retarget a brand-new message for the remainder.
     t.messageId = undefined;
     t.lastDelivered = undefined;

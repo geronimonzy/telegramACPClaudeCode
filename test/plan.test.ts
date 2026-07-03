@@ -6,6 +6,23 @@ import { FakeApi } from "./helpers/fake-api.js";
 
 const INTERVAL = 1000;
 
+const VOID_TAGS = new Set(["br", "hr", "img", "input"]);
+function isBalanced(html: string): boolean {
+  const tagRe = /<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g;
+  const stack: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html))) {
+    const full = m[0];
+    const name = m[1].toLowerCase();
+    if (full.startsWith("</")) {
+      if (stack.pop() !== name) return false;
+    } else if (!full.endsWith("/>") && !VOID_TAGS.has(name)) {
+      stack.push(name);
+    }
+  }
+  return stack.length === 0;
+}
+
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
@@ -13,8 +30,12 @@ function entry(overrides: Partial<acp.PlanEntry> = {}): acp.PlanEntry {
   return { content: "Do the thing", priority: "medium", status: "pending", ...overrides };
 }
 
-describe("PlanRenderer", () => {
-  it("renders header + one line per entry with status glyphs", async () => {
+function latest(api: FakeApi): string {
+  return api.edits.length > 0 ? api.edits[api.edits.length - 1][1] : api.sends[api.sends.length - 1];
+}
+
+describe("PlanRenderer (Rich)", () => {
+  it("renders a collapsible details panel with a done/total summary and one <li> per entry", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);
     const r = new PlanRenderer(live);
@@ -27,13 +48,17 @@ describe("PlanRenderer", () => {
     });
     await live.flushNow();
     const html = api.sends[0];
-    expect(html).toContain("<b>Plan</b>");
+    expect(html.startsWith("<details open><summary>")).toBe(true);
+    expect(html).toContain("📋 Plan — 1/3 done");
+    expect(html).toContain("<ul>");
     expect(html).toContain("☐");
     expect(html).toContain("🔄");
     expect(html).toContain("☑");
     expect(html).toContain("First");
     expect(html).toContain("Second");
     expect(html).toContain("Third");
+    expect(html.endsWith("</details>")).toBe(true);
+    expect(isBalanced(html)).toBe(true);
   });
 
   it("high priority entries get a ‼️ suffix", async () => {
@@ -45,7 +70,7 @@ describe("PlanRenderer", () => {
     expect(api.sends[0]).toContain("‼️");
   });
 
-  it("escapes entry content", async () => {
+  it("Rich-escapes entry content", async () => {
     const api = new FakeApi();
     const live = new LiveMessage(api, INTERVAL);
     const r = new PlanRenderer(live);
@@ -65,13 +90,14 @@ describe("PlanRenderer", () => {
     });
     r.onPlan({ entries: [entry({ content: "Only" })] });
     await live.flushNow();
-    const html = api.edits.length > 0 ? api.edits[api.edits.length - 1][1] : api.sends[api.sends.length - 1];
+    const html = latest(api);
     expect(html).toContain("Only");
     expect(html).not.toContain("One");
     expect(html).not.toContain("Two");
     expect(html).not.toContain("Three");
-    const lineCount = html.split("\n").filter((l) => l.includes("☐") || l.includes("🔄") || l.includes("☑")).length;
-    expect(lineCount).toBe(1);
+    const liCount = (html.match(/<li>/g) ?? []).length;
+    expect(liCount).toBe(1);
+    expect(html).toContain("📋 Plan — 0/1 done");
   });
 
   it("finalizeTurn flushes pending content", async () => {

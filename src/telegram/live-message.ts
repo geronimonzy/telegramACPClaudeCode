@@ -169,6 +169,7 @@ export class Throttle {
   }
 }
 
+/** Default budget for a plain-HTML live message (classic Telegram 4096 limit). */
 const LIVE_MAX_LEN = 4000;
 
 // The only tags the line-based renderers (activity.ts / plan.ts / permission
@@ -296,17 +297,16 @@ function splitLogicalLines(html: string): string[] {
  * line stays balanced; only an individual line that alone overflows is
  * char-truncated via {@link truncateHtmlSafe}.
  */
-function truncate(html: string): string {
-  if (html.length <= LIVE_MAX_LEN) return html;
+function truncate(html: string, max: number): string {
+  if (html.length <= max) return html;
   const lines = splitLogicalLines(html);
   const rawHeader = lines[0];
   const body = lines.slice(1);
   const total = body.length;
-  if (total === 0) return truncateHtmlSafe(rawHeader, LIVE_MAX_LEN);
+  if (total === 0) return truncateHtmlSafe(rawHeader, max);
   // Guard: a header alone at/over the budget would otherwise be emitted
   // un-truncated (only the total===0 path truncated it before this fix).
-  const header =
-    rawHeader.length >= LIVE_MAX_LEN ? truncateHtmlSafe(rawHeader, LIVE_MAX_LEN) : rawHeader;
+  const header = rawHeader.length >= max ? truncateHtmlSafe(rawHeader, max) : rawHeader;
 
   const indicatorFor = (n: number): string => `<i>… ${n} earlier</i>`;
 
@@ -318,7 +318,7 @@ function truncate(html: string): string {
     const dropped = idx; // keeping idx..end drops lines 0..idx-1
     const withLine = runningLen + 1 + body[idx].length; // "\n" + line
     const indicatorLen = dropped > 0 ? 1 + indicatorFor(dropped).length : 0;
-    if (withLine + indicatorLen <= LIVE_MAX_LEN) {
+    if (withLine + indicatorLen <= max) {
       runningLen = withLine;
       kept++;
     } else {
@@ -331,7 +331,7 @@ function truncate(html: string): string {
     const dropped = total - 1;
     let overhead = header.length + 1; // header + "\n"
     if (dropped > 0) overhead += indicatorFor(dropped).length + 1;
-    const budget = Math.max(1, LIVE_MAX_LEN - overhead);
+    const budget = Math.max(1, max - overhead);
     const parts = [header];
     if (dropped > 0) parts.push(indicatorFor(dropped));
     parts.push(truncateHtmlSafe(body[total - 1], budget));
@@ -353,16 +353,18 @@ function truncate(html: string): string {
  */
 export class LiveMessage {
   private content = "";
+  private readonly maxLen: number;
   private readonly t: Throttle;
 
-  constructor(api: MessageApi, intervalMs: number) {
+  constructor(api: MessageApi, intervalMs: number, maxLen: number = LIVE_MAX_LEN) {
+    this.maxLen = maxLen;
     this.t = new Throttle(api, intervalMs, async (t) => {
       await t.push(this.content, this.content);
     });
   }
 
   set(html: string): void {
-    this.content = truncate(html);
+    this.content = truncate(html, this.maxLen);
     this.t.notify();
   }
 
