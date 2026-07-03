@@ -211,37 +211,26 @@ export class Bridge {
   }
 
   /**
-   * Load persisted state and reattach every stored session. A stored id the
-   * agent no longer knows falls back to a fresh session (with a notice); a hard
-   * start failure notifies the topic and drops it from the store.
+   * Load persisted state and offer each stored session a Reconnect button.
+   *
+   * The bridge does NOT auto-reattach on boot: a restarted process has no live
+   * agent subprocesses, and eagerly respawning every stored session at startup
+   * is slow and surprising (it wakes agents the user may not touch this run).
+   * Instead each stored topic gets a one-tap Reconnect button; tapping it loads
+   * that session on demand (see {@link Bridge.handleCallback} → reconnect).
+   * Telegram persists each topic's message history, so a reconnect never needs
+   * to re-stream the transcript.
    */
   async init(): Promise<void> {
     await this.#store.load();
     const stored = this.#store.list();
     this.#seq = stored.length;
     for (const s of stored) {
-      try {
-        const session = await this.#spawnTopic(s.threadId, s.cwd, s.acpSessionId);
-        const agent = session.agentSession;
-        if (agent.loaded) {
-          await this.#send(s.threadId, `🔄 <b>${escapeHtml(s.title)}</b> — session restored.`);
-        } else {
-          // loadSession failed; AgentSession fell back to a fresh session.
-          await this.#store.upsert({ ...s, acpSessionId: agent.sessionId });
-          await this.#send(
-            s.threadId,
-            `⚠️ <b>${escapeHtml(s.title)}</b> — previous session could not be restored; started fresh.`,
-          );
-        }
-      } catch (e) {
-        logError(`reattach failed for thread ${s.threadId}`, e);
-        await this.#store.remove(s.threadId);
-        await this.#send(
-          s.threadId,
-          `💥 <b>${escapeHtml(s.title)}</b> — could not restart the agent. Use /new to start again or tap Restart.`,
-          this.#restartKeyboard(s.threadId),
-        );
-      }
+      await this.#send(
+        s.threadId,
+        `🔌 <b>${escapeHtml(s.title)}</b> — disconnected (bridge restarted). Tap Reconnect to resume.`,
+        this.#reconnectKeyboard(s.threadId),
+      );
     }
     await this.#botApi.setMyCommands(COMMAND_LIST).catch((e) => logError("setMyCommands", e));
   }
@@ -381,7 +370,19 @@ export class Bridge {
 
     const session = this.#sessions.get(threadId);
     if (!session) {
-      await this.#send(threadId, NO_SESSION);
+      // A stored-but-disconnected topic (e.g. after a bridge restart) still has
+      // persisted state — steer the user to Reconnect rather than /new, which
+      // would abandon the session. A topic with no stored state gets the plain
+      // "start one" notice.
+      if (this.#store.get(threadId)) {
+        await this.#send(
+          threadId,
+          "🔌 This session is disconnected. Tap Reconnect to resume.",
+          this.#reconnectKeyboard(threadId),
+        );
+      } else {
+        await this.#send(threadId, NO_SESSION);
+      }
       return;
     }
 
@@ -404,6 +405,7 @@ export class Bridge {
   ): Promise<{ toast: string } | undefined> {
     if (data.startsWith("perm:")) return this.#handlePermCallback(data, callbackMessageId);
     if (data.startsWith("mode:")) return this.#handleModeCallback(data, callbackMessageId);
+    if (data.startsWith("reconnect:")) return this.#handleReconnectCallback(data);
     if (data.startsWith("restart:")) return this.#handleRestartCallback(data);
     if (data.startsWith("attach:")) return this.#handleAttachCallback(data);
     return undefined;
@@ -714,6 +716,48 @@ export class Bridge {
     return { toast: `Mode: ${name}` };
   }
 
+  /**
+   * Reconnect a stored-but-disconnected topic (the boot-time Reconnect button).
+   * Loads the persisted ACP session on demand via `session/load`; replay chunks
+   * are suppressed (no `onReplayChunk`) since Telegram already holds the topic's
+   * history. If the agent no longer knows the id, AgentSession falls back to a
+   * fresh session and we say so + persist the new id. A hard failure re-offers
+   * the Reconnect button. A double-tap (already live) is a no-op.
+   */
+  async #handleReconnectCallback(data: string): Promise<{ toast: string }> {
+    const threadId = Number(data.slice("reconnect:".length));
+    const stored = this.#store.get(threadId);
+    if (!stored) return { toast: "no session" };
+    if (this.#sessions.has(threadId)) return { toast: "already connected" };
+
+    // Terminals from the pre-restart process (if any lingered) reference the old
+    // acp id; release them before loading so they don't leak past the reconnect.
+    this.#terminals.releaseForSession(stored.acpSessionId);
+    try {
+      const session = await this.#spawnTopic(threadId, stored.cwd, stored.acpSessionId);
+      const agent = session.agentSession;
+      if (agent.loaded) {
+        await this.#send(threadId, `🔌 <b>${escapeHtml(stored.title)}</b> — reconnected.`);
+        return { toast: "reconnected" };
+      }
+      // loadSession failed; AgentSession fell back to a fresh session.
+      await this.#store.upsert({ ...stored, acpSessionId: agent.sessionId });
+      await this.#send(
+        threadId,
+        `⚠️ <b>${escapeHtml(stored.title)}</b> — previous session could not be restored; started fresh.`,
+      );
+      return { toast: "started fresh" };
+    } catch (e) {
+      logError(`reconnect failed for thread ${threadId}`, e);
+      await this.#send(
+        threadId,
+        `💥 <b>${escapeHtml(stored.title)}</b> — could not reconnect. Tap Reconnect to retry.`,
+        this.#reconnectKeyboard(threadId),
+      );
+      return { toast: "reconnect failed" };
+    }
+  }
+
   async #handleRestartCallback(data: string): Promise<{ toast: string }> {
     const threadId = Number(data.slice("restart:".length));
     const stored = this.#store.get(threadId);
@@ -927,6 +971,10 @@ export class Bridge {
 
   #restartKeyboard(threadId: number): InlineKeyboard {
     return { inline_keyboard: [[{ text: "🔄 Restart", callback_data: `restart:${threadId}` }]] };
+  }
+
+  #reconnectKeyboard(threadId: number): InlineKeyboard {
+    return { inline_keyboard: [[{ text: "🔌 Reconnect", callback_data: `reconnect:${threadId}` }]] };
   }
 
   #modeKeyboard(threadId: number, agent: AgentSession): InlineKeyboard {

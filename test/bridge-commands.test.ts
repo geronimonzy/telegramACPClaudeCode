@@ -318,8 +318,8 @@ describe("Bridge", () => {
     expect(botApi.htmlFor(t1).join("\n")).toContain("agent restarted");
   });
 
-  it("init() reattaches a stored session via loadSession", async () => {
-    const { bridge, botApi, store } = makeBridge();
+  it("init() does NOT auto-reattach; it posts a Reconnect button per stored session", async () => {
+    const { bridge, botApi, store, mocks } = makeBridge();
     const stored: SessionState = {
       threadId: 555,
       acpSessionId: "sess_mock_1",
@@ -331,14 +331,39 @@ describe("Bridge", () => {
 
     await bridge.init();
 
-    expect(botApi.htmlFor(555).join("\n")).toContain("restored");
-    // Still usable: a text prompt routes into the reattached session.
-    await bridge.handleMessage(555, { text: "ping" });
-    // Store retained the reattached id.
+    // No agent was spawned on boot.
+    expect(mocks).toHaveLength(0);
+    // A disconnected notice with a Reconnect button landed in the topic.
+    const notice = botApi.messages.find((m) => m.threadId === 555 && /disconnected/i.test(m.html));
+    expect(notice).toBeDefined();
+    expect(notice!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:555");
+    // Store is untouched.
     expect(store.get(555)?.acpSessionId).toBe("sess_mock_1");
   });
 
-  it("init() falls back with a notice when the stored session id is unknown", async () => {
+  it("tapping Reconnect loads the stored session on demand", async () => {
+    const { bridge, botApi, store, mocks } = makeBridge();
+    const stored: SessionState = {
+      threadId: 555,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "restored-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+    await bridge.init();
+
+    const res = await bridge.handleCallback("reconnect:555", undefined);
+    expect(res?.toast).toBe("reconnected");
+    expect(mocks).toHaveLength(1);
+    expect(botApi.htmlFor(555).join("\n")).toContain("reconnected");
+    // Still usable: a text prompt now routes into the reconnected session.
+    await bridge.handleMessage(555, { text: "ping" });
+    expect(textOf(mocks[0]!)).toBe("ping");
+    expect(store.get(555)?.acpSessionId).toBe("sess_mock_1");
+  });
+
+  it("Reconnect falls back to a fresh session when the stored id is unknown", async () => {
     const { bridge, botApi, store } = makeBridge();
     const stored: SessionState = {
       threadId: 777,
@@ -348,12 +373,32 @@ describe("Bridge", () => {
       createdAt: new Date().toISOString(),
     };
     await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
-
     await bridge.init();
 
+    const res = await bridge.handleCallback("reconnect:777", undefined);
+    expect(res?.toast).toBe("started fresh");
     expect(botApi.htmlFor(777).join("\n")).toContain("started fresh");
     // The store was updated to the fresh session id.
     expect(store.get(777)?.acpSessionId).toBe("sess_mock_1");
+  });
+
+  it("a prompt into a disconnected topic offers Reconnect, not /new", async () => {
+    const { bridge, botApi } = makeBridge();
+    const stored: SessionState = {
+      threadId: 888,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "sleeping-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+    await bridge.init();
+
+    await bridge.handleMessage(888, { text: "hello?" });
+    const prompt = botApi.messages.find(
+      (m) => m.threadId === 888 && /disconnected/i.test(m.html) && m.keyboard,
+    );
+    expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
   });
 
   it("General topic accepts /new but refuses per-session commands", async () => {
