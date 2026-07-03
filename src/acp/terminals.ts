@@ -166,11 +166,22 @@ function killEntry(entry: TerminalEntry): void {
   }
 }
 
-/** Keep only the last `limit` bytes of `s` (UTF-8), cut at a char boundary. */
+/**
+ * Keep only the last `limit` bytes of `s` (UTF-8), cut at a code-point
+ * boundary. Trims from the front one code unit at a time, except that a
+ * leading high surrogate paired with a following low surrogate is removed
+ * together so an astral character (e.g. an emoji) is never split into a
+ * lone surrogate.
+ */
 function trimToLastBytes(s: string, limit: number): string {
   let result = s;
   while (Buffer.byteLength(result, "utf8") > limit) {
-    result = result.slice(1);
+    const first = result.charCodeAt(0);
+    const isHighSurrogate = first >= 0xd800 && first <= 0xdbff;
+    const second = isHighSurrogate ? result.charCodeAt(1) : undefined;
+    const isLowSurrogate =
+      second !== undefined && second >= 0xdc00 && second <= 0xdfff;
+    result = result.slice(isHighSurrogate && isLowSurrogate ? 2 : 1);
   }
   return result;
 }
