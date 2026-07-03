@@ -1,0 +1,15 @@
+# deploy/telegram-acp-bridge.service  (systemd USER unit)
+[Unit]
+Description=Telegram ACP bridge for Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/opt/telegram-acp-bridge/bin/telegram-acp-bridge
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
