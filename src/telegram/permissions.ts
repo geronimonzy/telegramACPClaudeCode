@@ -13,6 +13,7 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 import { escapeHtml } from "../html.js";
+import { log } from "../log.js";
 
 export interface PermissionPrompt {
   html: string; // message text: 🔐 <b>Permission</b>: tool title + salient rawInput in <code>
@@ -133,9 +134,9 @@ export class PermissionBroker {
           } else {
             // Already settled by an early tap or cancelThread(): the
             // permission decision stands, the prompt just failed to render.
-            console.error(
+            log.error(
+              { err },
               `permissions: present() failed for seq=${seq} after it was already settled by an early resolve/cancel`,
-              err,
             );
           }
         },

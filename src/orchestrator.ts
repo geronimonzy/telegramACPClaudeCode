@@ -26,6 +26,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import type { AgentSession } from "./acp/agent-session.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
+import { log } from "./log.js";
 import { MessageDraft } from "./telegram/draft.js";
 import { LiveMessage, type MessageApi } from "./telegram/live-message.js";
 import { ActivityRenderer } from "./telegram/activity.js";
@@ -55,9 +56,8 @@ export type UsageSnapshot = acp.UsageUpdate;
 
 const MAX_QUEUED = 5;
 
-/* eslint-disable no-console */
 function logError(context: string, e: unknown): void {
-  console.error(`[orchestrator] ${context}:`, e);
+  log.error({ err: e }, `[orchestrator] ${context}`);
 }
 
 /** Human-readable notice for a non-`end_turn` stop reason. */

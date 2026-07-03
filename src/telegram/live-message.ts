@@ -14,6 +14,7 @@
 // and `MessageDraft` (draft.ts) just supply what to render and how to split.
 
 import { escapeHtml } from "../html.js";
+import { log } from "../log.js";
 
 export interface MessageApi {
   send(html: string): Promise<number>; // sendMessage(HTML) → message_id
@@ -35,9 +36,8 @@ function isParseError(e: unknown): boolean {
   return e instanceof TgApiError && e.code === 400;
 }
 
-/* eslint-disable no-console */
 function logDrop(context: string, e: unknown): void {
-  console.error(`[telegram] dropped ${context} flush after fallback failed:`, e);
+  log.error({ err: e }, `[telegram] dropped ${context} flush after fallback failed`);
 }
 
 /**

@@ -19,6 +19,7 @@ import { makeFsHandlers } from "./acp/fs-handlers.js";
 import { TerminalRegistry } from "./acp/terminals.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
+import { log } from "./log.js";
 import { StateStore, type SessionState } from "./state.js";
 import { TopicSession, type TopicUi } from "./orchestrator.js";
 import { PermissionBroker } from "./telegram/permissions.js";
@@ -142,9 +143,8 @@ function chunk(text: string, limit: number): string[] {
   return out.length ? out : [text];
 }
 
-/* eslint-disable no-console */
 function logError(context: string, e: unknown): void {
-  console.error(`[bridge] ${context}:`, e);
+  log.error({ err: e }, `[bridge] ${context}`);
 }
 
 export class Bridge {

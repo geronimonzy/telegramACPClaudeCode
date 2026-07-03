@@ -10,8 +10,12 @@ import { Bot, InputFile, type Context } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { Message } from "@grammyjs/types";
 import type { Config } from "../config.js";
+import { log } from "../log.js";
 import { StateStore } from "../state.js";
 import { Bridge, type BotApi, type IncomingMsg, type InlineKeyboard } from "../bridge.js";
+
+/** Hard-exit grace period: if graceful shutdown hasn't finished by then, force exit. */
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /** The exact literal union grammY types `icon_color` as; our palette is a subset. */
 type IconColor = 0x6fb9f0 | 0xffd67e | 0xcb86db | 0x8eee98 | 0xff93b2 | 0xfb6f5f;
@@ -140,8 +144,7 @@ export async function runBot(cfg: Config): Promise<void> {
     try {
       await bridge.handleMessage(threadOf(ctx.message), normalize(ctx.message));
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("[bot] handleMessage failed:", e);
+      log.error({ err: e }, "[bot] handleMessage failed");
     }
   });
 
@@ -154,8 +157,7 @@ export async function runBot(cfg: Config): Promise<void> {
       );
       toast = res?.toast ?? "";
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("[bot] handleCallback failed:", e);
+      log.error({ err: e }, "[bot] handleCallback failed");
     } finally {
       // Always answer a handled callback so the client's spinner clears.
       await ctx.answerCallbackQuery(toast ? { text: toast } : {}).catch(() => {});
@@ -163,13 +165,32 @@ export async function runBot(cfg: Config): Promise<void> {
   });
 
   await bridge.init();
+  log.info(
+    { forumChatId: cfg.forumChatId, sessionCount: store.list().length },
+    "bridge ready",
+  );
 
-  const stop = async (): Promise<void> => {
-    await bot.stop();
-    await bridge.shutdown();
+  const stop = async (signal: string): Promise<void> => {
+    log.info({ signal }, "shutting down");
+    // Hard-exit safety net: if graceful shutdown hangs, force the process down
+    // rather than leaving it stuck. unref'd so it never itself keeps the
+    // process alive if shutdown finishes first.
+    const hardExit = setTimeout(() => {
+      log.error("shutdown did not complete in time; forcing exit");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    hardExit.unref();
+    try {
+      await bot.stop();
+      await bridge.shutdown();
+    } catch (e) {
+      log.error({ err: e }, "shutdown failed");
+    } finally {
+      clearTimeout(hardExit);
+    }
   };
-  process.once("SIGINT", () => void stop());
-  process.once("SIGTERM", () => void stop());
+  process.once("SIGINT", () => void stop("SIGINT"));
+  process.once("SIGTERM", () => void stop("SIGTERM"));
 
   await bot.start();
 }

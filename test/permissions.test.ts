@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import type * as acp from "@agentclientprotocol/sdk";
 import { PermissionBroker, type PermissionPrompt } from "../src/telegram/permissions.js";
+import { log } from "../src/log.js";
 
 function makeRequest(overrides: Partial<acp.RequestPermissionRequest> = {}): acp.RequestPermissionRequest {
   return {
@@ -215,7 +216,7 @@ describe("PermissionBroker", () => {
           rejectPresent = reject;
         }),
     );
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logErrorSpy = vi.spyOn(log, "error").mockImplementation(() => {});
     const req = makeRequest();
 
     const askPromise = broker.ask(5, req, present);
@@ -232,10 +233,10 @@ describe("PermissionBroker", () => {
     rejectPresent(err);
     await flush();
 
-    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
-    expect(consoleErrorSpy.mock.calls[0]).toContain(err);
+    expect(logErrorSpy).toHaveBeenCalledTimes(1);
+    expect(logErrorSpy.mock.calls[0]![0]).toEqual({ err });
 
-    consoleErrorSpy.mockRestore();
+    logErrorSpy.mockRestore();
   });
 
   it("falls back to an empty rawInput section when no known field is present", async () => {
