@@ -97,10 +97,24 @@ const UNKNOWN_COMMAND =
 const NO_SESSION =
   "No active session in this topic — /new to start one.";
 
-/** Parse a leading slash command; returns undefined for non-commands. */
+/**
+ * Parse a leading slash command; returns undefined for non-commands.
+ *
+ * ANY trimmed text starting with `/` is treated as a command attempt — never
+ * falls through to a raw prompt forward. The name capture is intentionally
+ * broad (`[^\s@]+`, not just `[A-Za-z0-9_:]+`) so hyphenated/unusual agent
+ * command names (`/pr-comments`, `/frobnicate-now`) are recognized as commands
+ * and run through the known/unknown decision, rather than slipping past the
+ * regex and being forwarded to the agent as an ordinary prompt. In the rare
+ * case the body doesn't match at all (e.g. `/` followed immediately by
+ * whitespace), we still return a (deliberately unmatchable) command so the
+ * caller's unknown-command path — not the prompt path — handles it.
+ */
 function parseCommand(text: string): { cmd: string; args: string } | undefined {
-  const m = /^\/([A-Za-z0-9_:]+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
-  if (!m) return undefined;
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return undefined;
+  const m = /^\/([^\s@]+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (!m) return { cmd: "", args: "" };
   return { cmd: m[1]!, args: (m[2] ?? "").trim() };
 }
 
@@ -507,12 +521,28 @@ export class Bridge {
     }
 
     if (msg.document) {
+      // Check the size Telegram already told us BEFORE calling getFile, so an
+      // oversized upload is refused without an extra round trip (mirrors the
+      // cap photos are held to).
+      if ((msg.document.fileSize ?? 0) > MAX_PHOTO_BYTES) {
+        await this.#send(threadId, "⚠️ file is larger than 20 MB — skipped.");
+        return blocks;
+      }
       const file = await this.#botApi.getFile(msg.document.fileId);
       if (file.filePath) {
         const buf = await this.#botApi.downloadFile(file.filePath);
         const dir = path.join(this.#cfg.dataDir, "uploads", String(threadId));
         await mkdir(dir, { recursive: true });
-        const absPath = path.join(dir, path.basename(msg.document.fileName));
+        const rawBase = path.basename(msg.document.fileName);
+        // `.` / `..` (and an empty basename) would otherwise resolve to the
+        // uploads dir itself or its parent once joined — reject those and
+        // fall back to a generated name instead of writing outside the
+        // per-thread upload directory.
+        const safeBase =
+          rawBase === "" || rawBase === "." || rawBase === ".."
+            ? `upload-${Date.now()}`
+            : rawBase;
+        const absPath = path.join(dir, safeBase);
         await writeFile(absPath, buf);
         if (msg.caption) blocks.push({ type: "text", text: msg.caption });
         blocks.push({ type: "text", text: `Attached file saved at: ${absPath}` });

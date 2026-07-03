@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { AgentSession } from "../src/acp/agent-session.js";
 import { Bridge, type AgentStarter } from "../src/bridge.js";
 import type { Config } from "../src/config.js";
 import { StateStore, type SessionState } from "../src/state.js";
+import { isAllowedUpdate } from "../src/telegram/bot.js";
 import { FakeBotApi } from "./helpers/fake-bot-api.js";
 import { wireMockAgent, type MockAgent } from "./helpers/mock-agent.js";
 
@@ -164,6 +165,47 @@ describe("Bridge", () => {
     expect(textOf(mocks[0]!, 1)).toBe("/review src/foo.ts");
   });
 
+  it("a hyphenated unknown slash command (/pr-comments) is refused, never forwarded", async () => {
+    const { bridge, botApi, mocks } = makeBridge();
+    await bridge.newTopic("a", undefined, async () => {});
+    const t1 = botApi.topics[0]!.threadId;
+
+    // Regression for the parseCommand name-capture bug: `[A-Za-z0-9_:]+`
+    // didn't match hyphens, so `/pr-comments` failed the command regex and
+    // fell through to a raw prompt forward. It must instead be recognized as
+    // a command attempt and refused as unknown.
+    await bridge.handleMessage(t1, { text: "/pr-comments" });
+
+    expect(botApi.allHtml()).toContain("Unknown command");
+    expect(mocks[0]!.received).toHaveLength(0);
+  });
+
+  it("forwards a hyphenated agent command verbatim when it is advertised", async () => {
+    const { bridge, botApi, mocks } = makeBridge();
+    await bridge.newTopic("a", undefined, async () => {});
+    const t1 = botApi.topics[0]!.threadId;
+
+    mocks[0]!.script = [
+      [
+        {
+          update: {
+            sessionUpdate: "available_commands_update",
+            availableCommands: [{ name: "pr-comments", description: "list PR comments" }],
+          },
+        },
+      ],
+      [],
+    ];
+    await bridge.handleMessage(t1, { text: "warmup" });
+    await tick();
+
+    await bridge.handleMessage(t1, { text: "/pr-comments 123" });
+    await tick();
+
+    expect(mocks[0]!.received).toHaveLength(2);
+    expect(textOf(mocks[0]!, 1)).toBe("/pr-comments 123");
+  });
+
   it("/end disposes the session, removes the store entry, and closes the topic", async () => {
     const { bridge, botApi, store } = makeBridge();
     await bridge.newTopic("a", undefined, async () => {});
@@ -220,5 +262,153 @@ describe("Bridge", () => {
 
     await bridge.handleMessage(undefined, { text: "/new fromgeneral" });
     expect(botApi.topics.some((t) => t.name === "fromgeneral")).toBe(true);
+  });
+
+  describe("/file containment", () => {
+    const scratchDirs: string[] = [];
+    afterEach(async () => {
+      await Promise.all(
+        scratchDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })),
+      );
+    });
+
+    it("refuses a relative path that escapes the cwd via ../../", async () => {
+      const { bridge, botApi } = makeBridge();
+      const cwd = await mkdtemp(join(tmpdir(), "bridge-file-"));
+      scratchDirs.push(cwd);
+      await bridge.newTopic("f", cwd, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/file ../../etc/passwd" });
+
+      expect(botApi.allHtml()).toContain("escapes the session directory");
+      expect(botApi.documents).toHaveLength(0);
+    });
+
+    it("refuses a crafted absolute path outside the cwd", async () => {
+      const { bridge, botApi } = makeBridge();
+      const cwd = await mkdtemp(join(tmpdir(), "bridge-file-"));
+      const outsideDir = await mkdtemp(join(tmpdir(), "bridge-outside-"));
+      scratchDirs.push(cwd, outsideDir);
+      const outsideFile = join(outsideDir, "secret.txt");
+      await writeFile(outsideFile, "top secret");
+      await bridge.newTopic("f", cwd, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: `/file ${outsideFile}` });
+
+      expect(botApi.allHtml()).toContain("escapes the session directory");
+      expect(botApi.documents).toHaveLength(0);
+    });
+
+    it("refuses a sibling directory that merely prefix-matches the cwd", async () => {
+      const { bridge, botApi } = makeBridge();
+      const cwd = await mkdtemp(join(tmpdir(), "bridge-file-"));
+      scratchDirs.push(cwd);
+      // e.g. cwd = /tmp/bridge-file-abc, sibling = /tmp/bridge-file-abc-evil —
+      // a naive `resolved.startsWith(base)` check (without the path.sep) would
+      // wrongly let this through.
+      const siblingDir = `${cwd}-evil`;
+      scratchDirs.push(siblingDir);
+      await mkdir(siblingDir, { recursive: true });
+      const siblingFile = join(siblingDir, "f");
+      await writeFile(siblingFile, "nope");
+      await bridge.newTopic("f", cwd, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: `/file ${siblingFile}` });
+
+      expect(botApi.allHtml()).toContain("escapes the session directory");
+      expect(botApi.documents).toHaveLength(0);
+    });
+
+    it("sends a legit relative file inside the cwd", async () => {
+      const { bridge, botApi } = makeBridge();
+      const cwd = await mkdtemp(join(tmpdir(), "bridge-file-"));
+      scratchDirs.push(cwd);
+      const filePath = join(cwd, "note.txt");
+      await writeFile(filePath, "hello");
+      await bridge.newTopic("f", cwd, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/file note.txt" });
+
+      expect(botApi.documents).toHaveLength(1);
+      expect(botApi.documents[0]!.filePath).toBe(filePath);
+    });
+  });
+
+  describe("document uploads", () => {
+    it("refuses an oversized document before calling getFile", async () => {
+      const cfg = makeConfig();
+      class ThrowingGetFileBotApi extends FakeBotApi {
+        async getFile(): Promise<{ filePath?: string; fileSize?: number }> {
+          throw new Error("getFile must not be called for an oversized document");
+        }
+      }
+      const botApi = new ThrowingGetFileBotApi();
+      const store = new StateStore(join(dir, "state.json"));
+      const mocks: MockAgent[] = [];
+      const starter: AgentStarter = async (opts) => {
+        const { agent, clientStream } = wireMockAgent();
+        mocks.push(agent);
+        return AgentSession.start({ ...opts, stream: clientStream, spawn: undefined });
+      };
+      const bridge = new Bridge(cfg, botApi, store, starter);
+      await bridge.newTopic("a", undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, {
+        document: { fileId: "doc1", fileName: "big.bin", fileSize: 25 * 1024 * 1024 },
+      });
+
+      expect(botApi.allHtml()).toContain("larger than 20 MB");
+      expect(mocks[0]!.received).toHaveLength(0);
+    });
+
+    it("sanitizes a '.'/'..' upload filename to a generated name", async () => {
+      const { bridge, botApi, mocks } = makeBridge();
+      await bridge.newTopic("a", undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      botApi.files.set("doc1", { filePath: "server/path/doc1", fileSize: 5 });
+      botApi.fileBytes.set("server/path/doc1", Buffer.from("hello"));
+
+      await bridge.handleMessage(t1, {
+        document: { fileId: "doc1", fileName: "..", fileSize: 5 },
+      });
+      await tick();
+
+      expect(mocks[0]!.received).toHaveLength(1);
+      const savedLine = textOf(mocks[0]!, 0);
+      expect(savedLine).toMatch(/^Attached file saved at: /);
+      const absPath = savedLine.replace("Attached file saved at: ", "");
+      expect(basename(absPath)).toMatch(/^upload-\d+$/);
+      await expect(readFile(absPath, "utf-8")).resolves.toBe("hello");
+    });
+  });
+});
+
+describe("isAllowedUpdate", () => {
+  const cfg = { allowedUserIds: [1, 2], forumChatId: -1000 };
+
+  it("allows an allowlisted user in the configured forum chat", () => {
+    expect(isAllowedUpdate(cfg, { id: 1 }, -1000)).toBe(true);
+  });
+
+  it("refuses a user who is not on the allowlist", () => {
+    expect(isAllowedUpdate(cfg, { id: 99 }, -1000)).toBe(false);
+  });
+
+  it("refuses the right user in the wrong chat", () => {
+    expect(isAllowedUpdate(cfg, { id: 1 }, -2000)).toBe(false);
+  });
+
+  it("refuses when `from` is missing", () => {
+    expect(isAllowedUpdate(cfg, undefined, -1000)).toBe(false);
+  });
+
+  it("refuses when the chat id is missing", () => {
+    expect(isAllowedUpdate(cfg, { id: 1 }, undefined)).toBe(false);
   });
 });

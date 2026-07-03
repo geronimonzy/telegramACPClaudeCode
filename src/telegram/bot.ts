@@ -102,6 +102,22 @@ function threadOf(m: Message): number | undefined {
 }
 
 /**
+ * The security guard predicate: allowlisted sender AND the configured forum
+ * chat, for both messages and callback queries. Pure so it's unit-testable
+ * without a grammY `Context`; the bot.ts middleware is a thin wrapper around
+ * it.
+ */
+export function isAllowedUpdate(
+  cfg: Pick<Config, "allowedUserIds" | "forumChatId">,
+  from: { id: number } | undefined,
+  chatId: number | undefined,
+): boolean {
+  if (from === undefined || !cfg.allowedUserIds.includes(from.id)) return false;
+  if (chatId !== cfg.forumChatId) return false;
+  return true;
+}
+
+/**
  * Boot the bot: build the Bridge, wire security guards + routing, register the
  * command list, reattach persisted sessions, and start long polling. Resolves
  * when polling stops (SIGINT/SIGTERM trigger a graceful shutdown).
@@ -116,9 +132,7 @@ export async function runBot(cfg: Config): Promise<void> {
   // SECURITY FIRST: allowlist + forum-chat guard run before any routing, for
   // messages AND callback queries. Non-matching updates are ignored silently.
   bot.use(async (ctx: Context, next) => {
-    const fromId = ctx.from?.id;
-    if (fromId === undefined || !cfg.allowedUserIds.includes(fromId)) return;
-    if (ctx.chat?.id !== cfg.forumChatId) return;
+    if (!isAllowedUpdate(cfg, ctx.from, ctx.chat?.id)) return;
     await next();
   });
 
