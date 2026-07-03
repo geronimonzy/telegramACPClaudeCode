@@ -156,4 +156,64 @@ describe("LiveMessage", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(api.sends).toEqual([content]);
   });
+
+  // Regression: activity.ts emits a diff row as `<b>title</b>\n<pre>{multi-line
+  // diff}</pre>` — the <pre> body contains RAW newlines. The old truncate()
+  // split on every "\n" as if each physical line were an independently
+  // balanced unit, so it could keep the tail "...</pre>" while dropping the
+  // "<pre>" opener that preceded it → orphan </pre> → Telegram 400. Truncation
+  // must operate on logical (tag-balanced) lines instead.
+  it("truncates multi-line <pre> diff rows on logical lines, keeping HTML balanced", async () => {
+    const api = new FakeApi();
+    const lm = new LiveMessage(api, INTERVAL);
+    const rows = Array.from(
+      { length: 60 },
+      (_, i) =>
+        `✅ ✏️ <b>edit foo ${i}</b>\n<pre>@@ -1 +1 @@\n-old line ${i}\n+new line ${i}</pre>`,
+    );
+    const content = ["<b>Activity</b>", ...rows].join("\n");
+    expect(content.length).toBeGreaterThan(4000);
+    lm.set(content);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(api.sends).toHaveLength(1);
+    const sent = api.sends[0];
+    expect(sent.length).toBeLessThanOrEqual(4000);
+    expect(sent.startsWith("<b>Activity</b>\n")).toBe(true); // header kept
+    expect(sent).toMatch(/<i>… \d+ earlier<\/i>/); // dropped-rows indicator
+    expect(isBalanced(sent)).toBe(true); // Telegram would reject otherwise
+
+    const preOpens = (sent.match(/<pre>/g) ?? []).length;
+    const preCloses = (sent.match(/<\/pre>/g) ?? []).length;
+    expect(preOpens).toBe(preCloses); // no orphan </pre> from the old bug
+
+    const bOpens = (sent.match(/<b>/g) ?? []).length;
+    const bCloses = (sent.match(/<\/b>/g) ?? []).length;
+    expect(bOpens).toBe(bCloses);
+
+    expect(sent).toContain("edit foo 59"); // newest row survives
+  });
+
+  it("a single <pre> diff row alone exceeding the budget is closed safely by truncateHtmlSafe", async () => {
+    const api = new FakeApi();
+    const lm = new LiveMessage(api, INTERVAL);
+    const diffLines = Array.from(
+      { length: 300 },
+      (_, i) => `-old line ${i}\n+new line ${i}`,
+    ).join("\n");
+    const content = `<b>Activity</b>\n✅ ✏️ <b>edit foo</b>\n<pre>${diffLines}</pre>`;
+    expect(content.length).toBeGreaterThan(4000);
+    lm.set(content);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(api.sends).toHaveLength(1);
+    const sent = api.sends[0];
+    expect(sent.length).toBeLessThanOrEqual(4000);
+    expect(isBalanced(sent)).toBe(true);
+    expect(sent.startsWith("<b>Activity</b>\n")).toBe(true);
+    expect(sent.endsWith("…")).toBe(true);
+    const preOpens = (sent.match(/<pre>/g) ?? []).length;
+    const preCloses = (sent.match(/<\/pre>/g) ?? []).length;
+    expect(preOpens).toBe(preCloses);
+  });
 });

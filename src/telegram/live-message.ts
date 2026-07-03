@@ -214,7 +214,13 @@ export function truncateHtmlSafe(line: string, max: number): string {
         }
       }
     } else {
-      next = i + 1;
+      // Advance by 2 over a surrogate pair (e.g. the emoji rows start with,
+      // "✅ 🔧 …") so we never cut between a high/low surrogate.
+      const code = line.charCodeAt(i);
+      const isHigh = code >= 0xd800 && code <= 0xdbff;
+      const nextCode = isHigh ? line.charCodeAt(i + 1) : undefined;
+      const isLow = nextCode !== undefined && nextCode >= 0xdc00 && nextCode <= 0xdfff;
+      next = i + (isHigh && isLow ? 2 : 1);
     }
     const closers = closersFor(nextStack);
     if (next + closers.length + ELL.length <= max) {
@@ -230,24 +236,77 @@ export function truncateHtmlSafe(line: string, max: number): string {
   return line.slice(0, cutPos) + cutClosers + ELL;
 }
 
+// Tags whose raw `\n` content must never be treated as a line break: their
+// content (e.g. a multi-line diff inside <pre>) is only balanced as a whole.
+const LINE_PROTECTING_TAGS = new Set(["pre", "blockquote"]);
+
+/**
+ * Split HTML into *logical* lines: `\n` is a line break everywhere except
+ * inside a `<pre>…</pre>` or `<blockquote>…</blockquote>` block, where the
+ * raw newlines (e.g. a multi-line diff) are part of one balanced unit. A
+ * depth counter (incremented/decremented on open/close of either tag) tracks
+ * this; a `\n` only ends a logical line when depth === 0. Each returned
+ * string is therefore an independently balanced HTML fragment, which is the
+ * invariant {@link truncate} relies on to keep/drop whole lines safely.
+ */
+function splitLogicalLines(html: string): string[] {
+  const lines: string[] = [];
+  let current = "";
+  let depth = 0;
+  let i = 0;
+  while (i < html.length) {
+    if (html[i] === "<") {
+      const end = html.indexOf(">", i);
+      if (end !== -1) {
+        const tag = html.slice(i, end + 1);
+        const m = /^<(\/?)([a-zA-Z][a-zA-Z0-9]*)/.exec(tag);
+        if (m && LINE_PROTECTING_TAGS.has(m[2].toLowerCase())) {
+          if (m[1] === "/") depth = Math.max(0, depth - 1);
+          else if (!tag.endsWith("/>")) depth++;
+        }
+        current += tag;
+        i = end + 1;
+        continue;
+      }
+    }
+    if (html[i] === "\n" && depth === 0) {
+      lines.push(current);
+      current = "";
+      i++;
+      continue;
+    }
+    current += html[i];
+    i++;
+  }
+  lines.push(current);
+  return lines;
+}
+
 /**
  * Tag-safe, line-aware truncation of LiveMessage content to `LIVE_MAX_LEN`.
  *
  * The content is a header line followed by one *independently balanced* HTML
- * line per row (see activity.ts / plan.ts). When it overflows we keep the
- * header and as many of the *newest* body lines as fit whole (the newest rows
- * matter most for a live feed), dropping the oldest. If any were dropped an
- * `<i>… N earlier</i>` indicator is inserted right after the header. Whole
- * lines are never cut, so every kept line stays balanced; only an individual
- * line that alone overflows is char-truncated via {@link truncateHtmlSafe}.
+ * line per row (see activity.ts / plan.ts) — where "line" means a *logical*
+ * line per {@link splitLogicalLines}: a diff row's `<pre>…</pre>` can itself
+ * span many raw newlines, and those stay glued to their `<pre>` as one unit.
+ * When it overflows we keep the header and as many of the *newest* body
+ * lines as fit whole (the newest rows matter most for a live feed), dropping
+ * the oldest. If any were dropped an `<i>… N earlier</i>` indicator is
+ * inserted right after the header. Whole lines are never cut, so every kept
+ * line stays balanced; only an individual line that alone overflows is
+ * char-truncated via {@link truncateHtmlSafe}.
  */
 function truncate(html: string): string {
   if (html.length <= LIVE_MAX_LEN) return html;
-  const lines = html.split("\n");
-  const header = lines[0];
+  const lines = splitLogicalLines(html);
+  const rawHeader = lines[0];
   const body = lines.slice(1);
   const total = body.length;
-  if (total === 0) return truncateHtmlSafe(header, LIVE_MAX_LEN);
+  if (total === 0) return truncateHtmlSafe(rawHeader, LIVE_MAX_LEN);
+  // Guard: a header alone at/over the budget would otherwise be emitted
+  // un-truncated (only the total===0 path truncated it before this fix).
+  const header =
+    rawHeader.length >= LIVE_MAX_LEN ? truncateHtmlSafe(rawHeader, LIVE_MAX_LEN) : rawHeader;
 
   const indicatorFor = (n: number): string => `<i>… ${n} earlier</i>`;
 
