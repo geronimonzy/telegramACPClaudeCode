@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { MessageDraft } from "../src/telegram/draft.js";
+import { MessageDraft, splitForRollover } from "../src/telegram/draft.js";
 import { escapeHtml } from "../src/html.js";
 import { FakeApi } from "./helpers/fake-api.js";
 
@@ -82,5 +82,39 @@ describe("MessageDraft", () => {
     await d.finalize();
     expect(api.sends).toEqual([rendered, escapeHtml(raw)]);
     expect(api.sends[1]).toBe("a &lt; b **x**");
+  });
+
+  it("splitForRollover on a trailing-newline overflow yields an empty remainder", () => {
+    // Regression fixture for the empty-remainder spurious-send bug: the cut
+    // lands on the buffer's trailing newline, so there is nothing left over.
+    const { prefix, remainder } = splitForRollover("a<>&*e*<>&```ts\n", 40);
+    expect(remainder).toBe("");
+    expect(prefix.length).toBeGreaterThan(0);
+  });
+
+  it("never sends an empty string and never starts a new message when the rollover remainder is empty", async () => {
+    const api = new FakeApi();
+    const d = new MessageDraft(api, { intervalMs: INTERVAL, maxLen: 40 });
+    d.append("a<>&*e*<>&```ts\n");
+    await d.finalize();
+    // Exactly one message: no retarget happened because remainder was empty.
+    expect(api.sends).toHaveLength(1);
+    expect(api.edits).toEqual([]);
+    for (const html of [...api.sends, ...api.edits.map(([, h]) => h)]) {
+      expect(html).not.toBe("");
+    }
+  });
+
+  it("a normal rollover (non-empty remainder) still starts a fresh message", async () => {
+    const api = new FakeApi();
+    const d = new MessageDraft(api, { intervalMs: INTERVAL, maxLen: 80 });
+    const code = Array.from({ length: 12 }, (_, i) => `fn${i}();`).join("\n");
+    d.append("```ts\n" + code + "\n```");
+    await d.finalize();
+    expect(api.sends.length).toBeGreaterThanOrEqual(2);
+    for (const html of api.sends) {
+      expect(html).not.toBe("");
+      expect(html.length).toBeLessThanOrEqual(80);
+    }
   });
 });

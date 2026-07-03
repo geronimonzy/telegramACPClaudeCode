@@ -23,8 +23,14 @@ export function splitForRollover(
   buffer: string,
   maxLen: number,
 ): { prefix: string; remainder: string } {
-  // Largest character count whose render still fits. Render length grows
-  // monotonically with input length for this markdown subset, so binary search.
+  // Binary search for the largest character count whose render still fits.
+  // Render length is *not* monotone in raw length in general (closing a fence
+  // can shorten output), but that's harmless here: `best` is only ever
+  // assigned on the `<= maxLen` branch, so a later non-monotone dip can only
+  // cause us to (safely) keep searching longer prefixes, never to accept one
+  // that doesn't fit. And reopening a fence across the cut adds no net
+  // rendered length, since an open fence is already auto-closed by
+  // mdToTelegramHtml.
   let lo = 1;
   let hi = buffer.length;
   let best = 0;
@@ -100,6 +106,15 @@ export class MessageDraft {
       return;
     }
     const { prefix, remainder } = splitForRollover(this.buffer, this.maxLen);
+    if (remainder === "") {
+      // The cut landed exactly on trailing content (e.g. a boundary newline)
+      // that contributed nothing to the next message — there is nothing to
+      // roll over. Deliver the prefix into the *current* message and don't
+      // retarget, or the next flush would send an empty string to a brand-new
+      // message id.
+      await t.push(mdToTelegramHtml(prefix), prefix);
+      return;
+    }
     await t.push(mdToTelegramHtml(prefix), prefix); // finalize current message
     // Retarget a brand-new message for the remainder.
     t.messageId = undefined;

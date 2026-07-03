@@ -131,12 +131,15 @@ export class Throttle {
   }
 
   /**
-   * The shared delivery primitive: skip-if-unchanged, then send (no message
-   * yet) or edit, with a one-shot escaped-plain fallback on a 400 parse error.
-   * `rawFallback` is the un-rendered source so the fallback can show the text
-   * literally instead of losing it.
+   * The shared delivery primitive: skip-if-empty, skip-if-unchanged, then send
+   * (no message yet) or edit, with a one-shot escaped-plain fallback on a 400
+   * parse error. `rawFallback` is the un-rendered source so the fallback can
+   * show the text literally instead of losing it. Empty `html` is always a
+   * no-op — Telegram rejects an empty send/edit, and callers should never have
+   * content to deliver that renders to nothing.
    */
   async push(html: string, rawFallback: string): Promise<void> {
+    if (html === "") return; // belt-and-braces: never emit an empty send/edit
     if (html === this.lastDelivered) return; // invariant (2)
     try {
       await this.deliver(html);
@@ -157,6 +160,7 @@ export class Throttle {
   }
 
   private async deliver(html: string): Promise<void> {
+    if (html === "") return; // belt-and-braces: never emit an empty send/edit
     if (this.messageId === undefined) {
       this.messageId = await this.api.send(html);
     } else {
