@@ -102,6 +102,12 @@ export class TopicSession {
   #turnRunning = false;
   #disposed = false;
   #agentExited = false;
+  // Set by cancel(), cleared at the start of the next turn (each prompt is a
+  // fresh consent context). Guards against a permission request that arrives
+  // after cancel()/dispose() registering a fresh pending ask nobody will ever
+  // settle (broker.cancelThread only settles asks already pending at the time
+  // it runs).
+  #cancelledTurn = false;
   readonly #queue: acp.ContentBlock[][] = [];
 
   // Per-turn surfaces (undefined between turns).
@@ -146,6 +152,7 @@ export class TopicSession {
 
   /** Cancel the in-flight turn: tell the agent, then settle pending permissions. */
   async cancel(): Promise<void> {
+    this.#cancelledTurn = true;
     await this.#agent.cancel();
     this.#broker.cancelThread(this.#threadId);
   }
@@ -204,6 +211,16 @@ export class TopicSession {
   async handlePermission(
     req: acp.RequestPermissionRequest,
   ): Promise<acp.RequestPermissionResponse> {
+    // A permission request can race a cancel()/dispose() that already fired:
+    // the agent may still emit `session/request_permission` for a tool call
+    // in flight when the cancel was issued. Registering a fresh pending ask
+    // at that point would leak it (broker.cancelThread only settles asks that
+    // were already pending when it ran) and would put up an orphaned
+    // Telegram prompt the agent may then block waiting on. Short-circuit
+    // instead: settle as cancelled without ever calling broker.ask.
+    if (this.#disposed || this.#cancelledTurn) {
+      return { outcome: { outcome: "cancelled" } };
+    }
     let messageId: number | undefined;
     const res = await this.#broker.ask(this.#threadId, req, async (p) => {
       messageId = await this.#ui.presentPermission(p);
@@ -243,6 +260,9 @@ export class TopicSession {
   }
 
   async #runOneTurn(blocks: acp.ContentBlock[]): Promise<void> {
+    // Each new turn is a fresh consent context: a cancel() from a prior turn
+    // must not shadow permission requests belonging to this one.
+    this.#cancelledTurn = false;
     this.#draft = new MessageDraft(this.#ui.messageApi(), {
       intervalMs: this.#cfg.editIntervalMs,
     });
@@ -304,9 +324,25 @@ export class TopicSession {
   }
 
   #startHeartbeat(): void {
-    this.#ui.typing();
-    this.#heartbeat = setInterval(() => this.#ui.typing(), this.#cfg.typingIntervalMs);
+    this.#typingSafe();
+    this.#heartbeat = setInterval(() => this.#typingSafe(), this.#cfg.typingIntervalMs);
     this.#heartbeat.unref?.();
+  }
+
+  /**
+   * `ui.typing()` is a best-effort heartbeat; per the brief it must never be
+   * allowed to kill a turn. A synchronous throw at turn start would otherwise
+   * propagate out of `#runOneTurn` before the try/catch is entered, and a
+   * throw from inside the `setInterval` callback would become an uncaught
+   * exception (timer callbacks aren't covered by any surrounding try/catch).
+   * Guard both call sites here: log and continue.
+   */
+  #typingSafe(): void {
+    try {
+      this.#ui.typing();
+    } catch (e) {
+      logError("typing failed", e);
+    }
   }
 
   #stopHeartbeat(): void {

@@ -15,6 +15,8 @@ class FakeUi implements TopicUi {
   notifications: string[] = [];
   permissionPrompts: PermissionPrompt[] = [];
   editedPermissions: Array<[number, string]> = [];
+  /** When true, every `typing()` call throws instead of recording. */
+  typingThrows = false;
   private nextPermMsgId = 1000;
 
   messageApi(): FakeApi {
@@ -24,6 +26,7 @@ class FakeUi implements TopicUi {
   }
   typing(): void {
     this.typingCount++;
+    if (this.typingThrows) throw new Error("typing boom");
   }
   async notify(html: string): Promise<void> {
     this.notifications.push(html);
@@ -51,6 +54,18 @@ function allContent(api: FakeApi): string {
 function textOf(req: acp.PromptRequest): string {
   const b = req.prompt[0];
   return b && b.type === "text" ? b.text : "";
+}
+
+/** A standalone permission request, for driving `handlePermission` directly. */
+function makeRequest(
+  overrides: Partial<acp.RequestPermissionRequest> = {},
+): acp.RequestPermissionRequest {
+  return {
+    sessionId: "sess-1",
+    toolCall: { toolCallId: "late", title: "Late tool call" },
+    options: allowRejectOptions,
+    ...overrides,
+  };
 }
 
 async function makeTopic(
@@ -235,5 +250,71 @@ describe("TopicSession", () => {
     // No further typing after dispose, and the queued prompt never ran.
     expect(ui.typingCount).toBe(typingAfterDispose);
     expect(mock.received).toHaveLength(1);
+  });
+
+  it("settles a permission request arriving after cancel() as cancelled without presenting it", async () => {
+    const { topic, ui } = await makeTopic([]);
+
+    await topic.cancel(); // no turn running; sets the cancelled-turn flag regardless
+
+    const res = await topic.handlePermission(makeRequest());
+
+    expect(res.outcome).toEqual({ outcome: "cancelled" });
+    expect(ui.permissionPrompts).toHaveLength(0);
+  });
+
+  it("settles a permission request arriving after dispose() as cancelled without presenting it", async () => {
+    const { topic, ui } = await makeTopic([]);
+
+    await topic.dispose();
+
+    const res = await topic.handlePermission(makeRequest());
+
+    expect(res.outcome).toEqual({ outcome: "cancelled" });
+    expect(ui.permissionPrompts).toHaveLength(0);
+  });
+
+  it("resumes presenting permissions normally once a new turn starts after a cancel", async () => {
+    const script: TurnScript[] = [
+      [
+        { permission: { toolCallId: "t1", options: allowRejectOptions } },
+        { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "unreached" } } },
+      ],
+      [{ permission: { toolCallId: "t2", options: allowRejectOptions } }],
+    ];
+    const { topic, ui, broker, mock } = await makeTopic(script);
+
+    // Turn 1: cancel mid-flight.
+    const p1 = topic.handleUserPrompt([{ type: "text", text: "go" }]);
+    await vi.waitFor(() => expect(ui.permissionPrompts).toHaveLength(1));
+    await topic.cancel();
+    await p1;
+    expect(mock.permissionOutcomes[0]?.outcome).toEqual({ outcome: "cancelled" });
+
+    // A late permission racing the cancel is still short-circuited...
+    const lateRes = await topic.handlePermission(makeRequest());
+    expect(lateRes.outcome).toEqual({ outcome: "cancelled" });
+    expect(ui.permissionPrompts).toHaveLength(1); // unchanged — not presented
+
+    // ...but turn 2 is a fresh consent context: permissions ask normally again.
+    const p2 = topic.handleUserPrompt([{ type: "text", text: "again" }]);
+    await vi.waitFor(() => expect(ui.permissionPrompts).toHaveLength(2));
+    await new Promise((r) => setTimeout(r, 10));
+    broker.resolve(ui.permissionPrompts[1]!.keyboard[0]![0]!.callback_data);
+    await p2;
+
+    expect(mock.permissionOutcomes[1]?.outcome).toEqual({ outcome: "selected", optionId: "allow" });
+  });
+
+  it("a throwing ui.typing() never kills the turn — draft finalizes and the prompt resolves", async () => {
+    const script: TurnScript[] = [
+      [{ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "still works" } } }],
+    ];
+    const { topic, ui } = await makeTopic(script);
+    ui.typingThrows = true;
+
+    await topic.handleUserPrompt([{ type: "text", text: "hi" }]);
+
+    expect(latest(ui.apis[0]!)).toContain("still works");
   });
 });

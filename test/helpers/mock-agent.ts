@@ -149,6 +149,10 @@ export class MockAgent implements acp.Agent {
 
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
     this.received.push(params);
+    // Each prompt() call starts a fresh turn: cancellation from a prior turn
+    // must not leak into this one (a real agent process doesn't stay
+    // "cancelled" forever once a turn concludes).
+    this.cancelled = false;
     const conn = this.#conn();
     const turn = this.script.shift() ?? [];
 
