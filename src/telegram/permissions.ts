@@ -32,14 +32,22 @@ const OPTION_NAME_MAX_LEN = 32;
 
 interface PendingAsk {
   threadId: number;
-  messageId: number;
+  // Backfilled once `present()` resolves; stays undefined if a `resolve()`
+  // (or `cancelThread()`) settles this entry before `present()` returns —
+  // i.e. the tap won the race against the prompt actually being sent.
+  messageId: number | undefined;
   options: acp.PermissionOption[];
   resolve: (r: acp.RequestPermissionResponse) => void;
 }
 
-/** Truncates `s` to `max` chars, appending an ellipsis if it was cut. */
+/**
+ * Truncates `s` to `max` Unicode code points (not UTF-16 code units),
+ * appending an ellipsis if it was cut. Code-point aware so it never splits
+ * a surrogate pair (e.g. an emoji) sitting at the boundary.
+ */
 function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + "…" : s;
+  const codePoints = Array.from(s);
+  return codePoints.length > max ? codePoints.slice(0, max).join("") + "…" : s;
 }
 
 /**
@@ -86,9 +94,17 @@ export class PermissionBroker {
   #pending = new Map<number, PendingAsk>();
 
   /**
-   * Builds the prompt, hands it to `present` (which sends the Telegram
-   * message and returns its message_id), and resolves once `resolve()` or
-   * `cancelThread()` settles the matching pending entry.
+   * Registers the pending entry *before* calling `present` (so a fast tap
+   * racing a slow `present()` can never find the map empty and be dropped),
+   * then hands the prompt to `present` (which sends the Telegram message and
+   * returns its message_id). Resolves once `resolve()` or `cancelThread()`
+   * settles the matching pending entry.
+   *
+   * If `present()` rejects: when the entry is still unsettled, the entry is
+   * removed and the rejection propagates to the caller. When an early tap
+   * (or `cancelThread`) already settled the entry, the rejection is logged
+   * and swallowed instead — the permission decision already stands, and only
+   * the prompt message failed to render.
    */
   async ask(
     threadId: number,
@@ -97,9 +113,33 @@ export class PermissionBroker {
   ): Promise<acp.RequestPermissionResponse> {
     const seq = this.#seq++;
     const prompt = buildPrompt(req, seq);
-    const messageId = await present(prompt);
-    return new Promise<acp.RequestPermissionResponse>((resolve) => {
-      this.#pending.set(seq, { threadId, messageId, options: req.options, resolve });
+
+    return new Promise<acp.RequestPermissionResponse>((resolve, reject) => {
+      const entry: PendingAsk = { threadId, messageId: undefined, options: req.options, resolve };
+      this.#pending.set(seq, entry);
+
+      present(prompt).then(
+        (messageId) => {
+          // Backfill only if still pending — an early tap/cancel may have
+          // already settled (and deleted) this entry.
+          if (this.#pending.has(seq)) {
+            entry.messageId = messageId;
+          }
+        },
+        (err: unknown) => {
+          if (this.#pending.has(seq)) {
+            this.#pending.delete(seq);
+            reject(err);
+          } else {
+            // Already settled by an early tap or cancelThread(): the
+            // permission decision stands, the prompt just failed to render.
+            console.error(
+              `permissions: present() failed for seq=${seq} after it was already settled by an early resolve/cancel`,
+              err,
+            );
+          }
+        },
+      );
     });
   }
 
@@ -108,8 +148,13 @@ export class PermissionBroker {
    * `callback_data`. Returns undefined for malformed/unknown/already-settled
    * data (double-resolve is a no-op, not an error — Telegram can deliver a
    * duplicate callback_query on retry).
+   *
+   * `messageId` may be undefined when this tap won the race against the
+   * still-in-flight `present()` call for the same ask (fast tap, slow send):
+   * the caller should fall back to the callback query's own message id in
+   * that case.
    */
-  resolve(callbackData: string): { threadId: number; messageId: number; label: string } | undefined {
+  resolve(callbackData: string): { threadId: number; messageId: number | undefined; label: string } | undefined {
     const m = /^perm:(\d+):(\d+)$/.exec(callbackData);
     if (!m) return undefined;
     const seq = Number(m[1]);
