@@ -183,6 +183,11 @@ export class Bridge {
   // new `/sessions` call and per-entry on use, so a stale button is a no-op.
   #attachSeq = 0;
   readonly #attachTargets = new Map<number, { sessionId: string; cwd: string; title: string }>();
+  // Session ids with an attach currently in flight. The store entry is only
+  // written after the (possibly long) history replay finishes, so without this
+  // a /sessions re-list during a replay would still offer the same session and
+  // allow a duplicate attach.
+  readonly #attaching = new Set<string>();
 
   constructor(
     cfg: Config,
@@ -751,7 +756,7 @@ export class Bridge {
 
     const attached = new Set(this.#store.list().map((s) => s.acpSessionId));
     const available = sessions
-      .filter((s) => !attached.has(s.sessionId))
+      .filter((s) => !attached.has(s.sessionId) && !this.#attaching.has(s.sessionId))
       .slice(0, MAX_LISTED_SESSIONS);
 
     if (available.length === 0) {
@@ -818,6 +823,15 @@ export class Bridge {
     const target = this.#attachTargets.get(k);
     if (!target) return { toast: "session no longer listed" };
     this.#attachTargets.delete(k); // evict on use
+    this.#attaching.add(target.sessionId);
+    try {
+      return await this.#attachTarget(target);
+    } finally {
+      this.#attaching.delete(target.sessionId);
+    }
+  }
+
+  async #attachTarget(target: { sessionId: string; cwd: string; title: string }): Promise<{ toast: string }> {
 
     const title = truncate(target.title, MAX_TITLE_LEN);
     const n = ++this.#seq;

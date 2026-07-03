@@ -95,7 +95,7 @@ Copy `config.example.json` (or let `install.sh` do it — see below) to
 | `editIntervalMs` | number | no | `1500` | Minimum interval between live-message edits while a response streams. |
 | `typingIntervalMs` | number | no | `4500` | Interval for refreshing the "typing…" chat action while a turn is in flight. |
 | `showThoughts` | boolean | no | `false` | Forward the agent's thinking/reasoning blocks to Telegram. |
-| `adapterCommand` | string[] | no | `["npx", "-y", "claude-agent-acp"]` | Command used to spawn the ACP adapter process. |
+| `adapterCommand` | string[] | no | bundled `node_modules/.bin/claude-agent-acp` | Override for the command used to spawn the ACP adapter process. When omitted, the adapter binary bundled with the app is used. |
 | `adapterEnv` | object (string → string) | no | `{}` | Extra environment variables passed to the adapter process. |
 | `dataDir` | string | no | `~/.local/share/telegram-acp-bridge` | Directory for persisted session state (`state.json`) and uploaded-document storage. `~` is expanded. |
 
