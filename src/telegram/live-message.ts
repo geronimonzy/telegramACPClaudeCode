@@ -171,10 +171,119 @@ export class Throttle {
 
 const LIVE_MAX_LEN = 4000;
 
-/** Truncates to `LIVE_MAX_LEN` graphemes-ish (chars) with a trailing ellipsis. */
+// The only tags the line-based renderers (activity.ts / plan.ts / permission
+// prompts) ever emit. `truncateHtmlSafe` tracks these so a mid-line char cut
+// can re-close whatever was left open.
+const OPENABLE_TAGS = new Set(["b", "i", "u", "s", "code", "pre", "a", "blockquote"]);
+
+/**
+ * Char-truncate a single balanced-HTML line to at most `max` characters
+ * without ever cutting inside a `<...>` tag and without leaving a tag open:
+ * any tags still open at the cut are closed (innermost first) before the
+ * trailing ellipsis. Used only for an individual line that alone overflows
+ * the budget; whole lines are kept verbatim by {@link truncate}.
+ */
+export function truncateHtmlSafe(line: string, max: number): string {
+  if (line.length <= max) return line;
+  const ELL = "…";
+  const closersFor = (st: string[]): string =>
+    [...st].reverse().map((t) => `</${t}>`).join("");
+
+  let cutPos = 0;
+  let cutClosers = "";
+  const stack: string[] = [];
+  let i = 0;
+  while (i < line.length) {
+    let next: number;
+    const nextStack = stack.slice();
+    if (line[i] === "<") {
+      const end = line.indexOf(">", i);
+      if (end === -1) {
+        next = i + 1; // malformed '<' with no '>' → treat as a literal char
+      } else {
+        const tag = line.slice(i, end + 1);
+        next = end + 1;
+        const m = /^<(\/?)([a-zA-Z][a-zA-Z0-9]*)/.exec(tag);
+        if (m) {
+          const name = m[2];
+          if (m[1] === "/") {
+            if (nextStack[nextStack.length - 1] === name) nextStack.pop();
+          } else if (!tag.endsWith("/>") && OPENABLE_TAGS.has(name)) {
+            nextStack.push(name);
+          }
+        }
+      }
+    } else {
+      next = i + 1;
+    }
+    const closers = closersFor(nextStack);
+    if (next + closers.length + ELL.length <= max) {
+      cutPos = next;
+      cutClosers = closers;
+      stack.length = 0;
+      for (const t of nextStack) stack.push(t);
+      i = next;
+    } else {
+      break;
+    }
+  }
+  return line.slice(0, cutPos) + cutClosers + ELL;
+}
+
+/**
+ * Tag-safe, line-aware truncation of LiveMessage content to `LIVE_MAX_LEN`.
+ *
+ * The content is a header line followed by one *independently balanced* HTML
+ * line per row (see activity.ts / plan.ts). When it overflows we keep the
+ * header and as many of the *newest* body lines as fit whole (the newest rows
+ * matter most for a live feed), dropping the oldest. If any were dropped an
+ * `<i>… N earlier</i>` indicator is inserted right after the header. Whole
+ * lines are never cut, so every kept line stays balanced; only an individual
+ * line that alone overflows is char-truncated via {@link truncateHtmlSafe}.
+ */
 function truncate(html: string): string {
   if (html.length <= LIVE_MAX_LEN) return html;
-  return html.slice(0, LIVE_MAX_LEN - 1) + "…";
+  const lines = html.split("\n");
+  const header = lines[0];
+  const body = lines.slice(1);
+  const total = body.length;
+  if (total === 0) return truncateHtmlSafe(header, LIVE_MAX_LEN);
+
+  const indicatorFor = (n: number): string => `<i>… ${n} earlier</i>`;
+
+  // Greedily keep the newest body lines that fit whole, budgeting for the
+  // header and (once anything is dropped) the indicator line.
+  let runningLen = header.length;
+  let kept = 0;
+  for (let idx = total - 1; idx >= 0; idx--) {
+    const dropped = idx; // keeping idx..end drops lines 0..idx-1
+    const withLine = runningLen + 1 + body[idx].length; // "\n" + line
+    const indicatorLen = dropped > 0 ? 1 + indicatorFor(dropped).length : 0;
+    if (withLine + indicatorLen <= LIVE_MAX_LEN) {
+      runningLen = withLine;
+      kept++;
+    } else {
+      break;
+    }
+  }
+
+  if (kept === 0) {
+    // Even the newest single line doesn't fit whole → keep it, char-truncated.
+    const dropped = total - 1;
+    let overhead = header.length + 1; // header + "\n"
+    if (dropped > 0) overhead += indicatorFor(dropped).length + 1;
+    const budget = Math.max(1, LIVE_MAX_LEN - overhead);
+    const parts = [header];
+    if (dropped > 0) parts.push(indicatorFor(dropped));
+    parts.push(truncateHtmlSafe(body[total - 1], budget));
+    return parts.join("\n");
+  }
+
+  const dropped = total - kept;
+  const parts = [header];
+  if (dropped > 0) parts.push(indicatorFor(dropped));
+  for (const l of body.slice(total - kept)) parts.push(l);
+  return parts.join("\n");
 }
 
 /**

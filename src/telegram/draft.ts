@@ -11,13 +11,119 @@ import { type MessageApi, Throttle } from "./live-message.js";
 
 const DEFAULT_MAX_LEN = 4000;
 
+/** A markdown table row: a line whose trimmed text begins with `|`. */
+function isTableRow(line: string): boolean {
+  return line.trim().startsWith("|");
+}
+
+/** A line that begins a markdown list item (`- `, `* `, `+ `, or `1.`). */
+function isListItem(line: string): boolean {
+  return /^\s*([-*+]|\d+\.)\s/.test(line);
+}
+
+/**
+ * Choose the raw index at which {@link splitForRollover} should cut, given the
+ * binary-search `best` (largest raw index whose rendered prefix ≤ `maxLen`).
+ * Returns a newline index (the boundary is consumed) or, when no usable newline
+ * exists at/before `best`, `best` itself for a hard character cut.
+ *
+ * Priority (searching at/before `best`): (1) the closest paragraph separator
+ * (`\n\s*\n`) whose prefix is ≥ a floor of `maxLen/2`; (2) the closest
+ * block-boundary newline (table↔non-table, list↔non-list, or between two list
+ * items), preferring ≥ floor but ignoring the floor if nothing qualifies;
+ * (3) the last newline at/before `best`; (4) a hard char cut. Tiers 1–2 never
+ * cut inside a code fence; tiers 2–3 never end the prefix mid-table — a
+ * straddling table is rolled whole into the next message, unless that would
+ * drop below the floor or the table alone exceeds `maxLen`, in which case the
+ * cut falls on a table *row* boundary (never mid-row).
+ */
+export function chooseCut(buffer: string, best: number, maxLen: number): number {
+  const floor = maxLen * 0.5;
+  const lines = buffer.split("\n");
+  const lineStart: number[] = [];
+  {
+    let off = 0;
+    for (const ln of lines) {
+      lineStart.push(off);
+      off += ln.length + 1;
+    }
+  }
+  const nlAfter = (i: number): number => lineStart[i] + lines[i].length;
+  const insideFence = (idx: number): boolean => fenceState(buffer.slice(0, idx)) !== null;
+  const renderedLen = (idx: number): number => mdToTelegramHtml(buffer.slice(0, idx)).length;
+
+  // If a chosen newline falls in the middle of a table block, move the cut to
+  // just before the table so the whole table rolls over — unless that drops
+  // below the floor or the table alone won't fit, in which case keep the cut on
+  // the row boundary (the `\n` guarantees it is never mid-row).
+  const protectTable = (cut: number, i: number): number => {
+    if (!(isTableRow(lines[i]) && isTableRow(lines[i + 1]))) return cut;
+    let s = i;
+    while (s > 0 && isTableRow(lines[s - 1])) s--;
+    let e = i + 1;
+    while (e + 1 < lines.length && isTableRow(lines[e + 1])) e++;
+    if (s >= 1) {
+      const before = lineStart[s] - 1; // newline ending line s-1
+      const tableRendered = mdToTelegramHtml(lines.slice(s, e + 1).join("\n")).length;
+      if (before > 0 && renderedLen(before) >= floor && tableRendered <= maxLen) {
+        return before;
+      }
+    }
+    return cut; // fall back to the row boundary
+  };
+
+  // Tier 1: paragraph separator — a blank (whitespace-only) line with content
+  // before and after, closest to `best`, outside any fence, prefix ≥ floor.
+  for (let i = lines.length - 2; i >= 1; i--) {
+    if (lines[i].trim() !== "") continue;
+    const cut = nlAfter(i);
+    if (cut <= 0 || cut > best) continue;
+    if (insideFence(cut)) continue;
+    if (renderedLen(cut) < floor) continue;
+    return cut;
+  }
+
+  // Tier 2: block-boundary newline (table/list edges, inter-item breaks).
+  let blockFallback = -1;
+  for (let i = lines.length - 2; i >= 0; i--) {
+    const cut = nlAfter(i);
+    if (cut <= 0 || cut > best) continue;
+    if (insideFence(cut)) continue;
+    const a = lines[i];
+    const b = lines[i + 1];
+    const listEdge = isListItem(a) || isListItem(b);
+    const tableEdge = isTableRow(a) !== isTableRow(b);
+    if (!listEdge && !tableEdge) continue;
+    if (blockFallback === -1) blockFallback = cut; // closest block boundary ≤ best
+    if (renderedLen(cut) >= floor) return protectTable(cut, i);
+  }
+  if (blockFallback !== -1) {
+    // Recover the line index for the fallback boundary to apply table protection.
+    const i = lineStart.findIndex((_, k) => nlAfter(k) === blockFallback);
+    return protectTable(blockFallback, i);
+  }
+
+  // Tier 3: the last newline at/before best (current behaviour). Cuts inside a
+  // fence are allowed here — the fence is re-opened across the boundary.
+  const nl = buffer.lastIndexOf("\n", best);
+  if (nl > 0) {
+    if (insideFence(nl)) return nl;
+    const i = lineStart.findIndex((_, k) => nlAfter(k) === nl);
+    return i >= 0 ? protectTable(nl, i) : nl;
+  }
+
+  // Tier 4: no usable newline → hard character cut at `best`.
+  return best;
+}
+
 /**
  * Split a raw-markdown buffer whose render exceeds `maxLen` into a `prefix`
  * (renders ≤ maxLen, becomes the finalized message) and a `remainder` (the new
- * buffer). Cuts at the last newline whose prefix still fits; falls back to a
- * hard character cut when a single line overflows. If the prefix ends inside an
- * open code fence, the fence is closed in the prefix and re-opened at the top
- * of the remainder with the same language.
+ * buffer). The cut point is chosen by {@link chooseCut} — preferring paragraph,
+ * then table/list, then any line boundary — and falls back to a hard character
+ * cut when a single line overflows. If the prefix ends inside an open code
+ * fence, the fence is closed in the prefix and re-opened at the top of the
+ * remainder with the same language.
  */
 export function splitForRollover(
   buffer: string,
@@ -45,17 +151,17 @@ export function splitForRollover(
   }
   best = Math.max(best, 1); // always make progress, even if one char overflows
 
-  // Prefer to cut on a line boundary at or before `best`.
-  const nl = buffer.lastIndexOf("\n", best);
+  // Choose a meaningful cut point (paragraph → table/list → any line → hard).
+  const cut = chooseCut(buffer, best, maxLen);
   let prefix: string;
   let remainder: string;
-  if (nl > 0) {
-    prefix = buffer.slice(0, nl);
-    remainder = buffer.slice(nl + 1); // consume the boundary newline
+  if (buffer[cut] === "\n") {
+    prefix = buffer.slice(0, cut);
+    remainder = buffer.slice(cut + 1); // consume the boundary newline
   } else {
     // No usable newline in range → hard character cut.
-    prefix = buffer.slice(0, best);
-    remainder = buffer.slice(best);
+    prefix = buffer.slice(0, cut);
+    remainder = buffer.slice(cut);
   }
 
   const openLang = fenceState(prefix);

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { MessageDraft, splitForRollover } from "../src/telegram/draft.js";
-import { escapeHtml } from "../src/html.js";
+import { MessageDraft, splitForRollover, chooseCut } from "../src/telegram/draft.js";
+import { escapeHtml, mdToTelegramHtml } from "../src/html.js";
 import { FakeApi } from "./helpers/fake-api.js";
 
 const INTERVAL = 1000;
@@ -116,5 +116,80 @@ describe("MessageDraft", () => {
       expect(html).not.toBe("");
       expect(html.length).toBeLessThanOrEqual(80);
     }
+  });
+});
+
+describe("splitForRollover cut selection", () => {
+  it("prefers a paragraph separator over a later mid-paragraph line break", () => {
+    const para1 = "A".repeat(60);
+    const para2 = Array.from({ length: 20 }, () => "xxxx").join("\n");
+    const buffer = para1 + "\n\n" + para2;
+    const { prefix, remainder } = splitForRollover(buffer, 100);
+    expect(prefix).toContain(para1);
+    expect(prefix).not.toContain("xxxx"); // did not spill into para2
+    expect(remainder.startsWith("xxxx")).toBe(true); // remainder begins at para2
+  });
+
+  it("falls back to a line break when no in-range paragraph separator exists", () => {
+    const buffer = Array.from({ length: 50 }, () => "word").join("\n");
+    const cut = chooseCut(buffer, buffer.length, 100);
+    expect(buffer[cut]).toBe("\n"); // a clean line boundary, not a hard char cut
+    const { remainder } = splitForRollover(buffer, 100);
+    expect(remainder.startsWith("word")).toBe(true);
+  });
+
+  it("keeps a straddling table whole: prefix ends before it, remainder starts with the full table", () => {
+    const head = "H".repeat(70);
+    const rows = [
+      "| aaaa | bbbb |",
+      "| ---- | ---- |",
+      "| 1111 | 2222 |",
+      "| 3333 | 4444 |",
+      "| 5555 | 6666 |",
+      "| 7777 | 8888 |",
+    ];
+    const buffer = head + "\n" + rows.join("\n") + "\ntrailing";
+    const { prefix, remainder } = splitForRollover(buffer, 120);
+    expect(prefix).toBe(head); // whole table rolled over, none of it in the prefix
+    expect(remainder.startsWith("| aaaa | bbbb |")).toBe(true);
+    for (const r of rows) expect(remainder).toContain(r);
+  });
+
+  it("splits a table larger than maxLen at a row boundary, never mid-row", () => {
+    const rows = Array.from({ length: 20 }, (_, i) => `| r${i}a | r${i}b |`);
+    const buffer = rows.join("\n");
+    const { prefix, remainder } = splitForRollover(buffer, 80);
+    // Prefix ends on a complete row; remainder resumes on a complete row.
+    const lastPrefixLine = prefix.split("\n").at(-1)!;
+    expect(/^\| r\d+a \| r\d+b \|$/.test(lastPrefixLine)).toBe(true);
+    expect(remainder.startsWith("| r")).toBe(true);
+    expect(remainder.split("\n")[0]).toMatch(/^\| r\d+a \| r\d+b \|$/);
+  });
+
+  it("splits a long list between items (remainder begins at a list marker)", () => {
+    const buffer = Array.from({ length: 40 }, (_, i) => `- item number ${i}`).join("\n");
+    const { prefix, remainder } = splitForRollover(buffer, 120);
+    expect(remainder.startsWith("- item number ")).toBe(true);
+    for (const line of prefix.split("\n")) {
+      expect(line.startsWith("- item number ")).toBe(true); // no partial item
+    }
+  });
+
+  it("re-opens a code fence across the new cut logic", () => {
+    const code = Array.from({ length: 12 }, (_, i) => `fn${i}();`).join("\n");
+    const buffer = "```ts\n" + code + "\n```";
+    const { prefix, remainder } = splitForRollover(buffer, 80);
+    expect(prefix.endsWith("\n```")).toBe(true); // fence closed in prefix
+    expect(remainder.startsWith("```ts\n")).toBe(true); // and re-opened
+    expect(mdToTelegramHtml(prefix).length).toBeLessThanOrEqual(80);
+  });
+
+  it("hard-cuts a single line longer than maxLen", () => {
+    const buffer = "Z".repeat(500);
+    const { prefix, remainder } = splitForRollover(buffer, 100);
+    expect(prefix.length).toBeGreaterThan(0);
+    expect(remainder.length).toBeGreaterThan(0);
+    expect(prefix + remainder).toBe(buffer); // hard cut loses nothing
+    expect(mdToTelegramHtml(prefix).length).toBeLessThanOrEqual(100);
   });
 });
