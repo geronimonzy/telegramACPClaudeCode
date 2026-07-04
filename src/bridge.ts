@@ -106,6 +106,8 @@ const TELEGRAM_MSG_LIMIT = 4000;
 const MAX_LISTED_SESSIONS = 10;
 /** Telegram forum-topic titles are capped at 128 chars; keep well under. */
 const MAX_TITLE_LEN = 64;
+/** How often the 📊 Claude Usage panel refreshes itself (edit-only). */
+const USAGE_REFRESH_MS = 60 * 60 * 1000;
 
 /** Expand a leading `~` / `~/` to the user's home directory. */
 function expandHome(p: string): string {
@@ -239,6 +241,7 @@ export class Bridge {
   // The 📊 Claude Usage topic + its single edited stats message, persisted at
   // {dataDir}/usage-topic.json so the topic is reused across restarts.
   #usageTopic: { threadId: number; messageId?: number } | undefined;
+  #usageTimer: ReturnType<typeof setInterval> | undefined;
   readonly #collectUsage: () => Promise<UsageStats>;
 
   constructor(
@@ -278,6 +281,12 @@ export class Bridge {
       );
     }
     await this.#botApi.setMyCommands(COMMAND_LIST).catch((e) => logError("setMyCommands", e));
+
+    // Hourly usage-panel refresh. Edit-only: it keeps an existing 📊 topic
+    // current but never creates one — that stays a /usage decision. unref'd
+    // so the timer alone never keeps the process alive.
+    this.#usageTimer = setInterval(() => void this.#refreshUsagePanel(), USAGE_REFRESH_MS);
+    this.#usageTimer.unref?.();
   }
 
   /**
@@ -480,6 +489,10 @@ export class Bridge {
 
   /** Dispose every session + agent, kill terminals. Store is persisted eagerly. */
   async shutdown(): Promise<void> {
+    if (this.#usageTimer !== undefined) {
+      clearInterval(this.#usageTimer);
+      this.#usageTimer = undefined;
+    }
     for (const session of this.#sessions.values()) {
       try {
         await session.dispose();
@@ -1135,14 +1148,32 @@ export class Bridge {
    * wherever the command was issued (unless that IS the stats topic).
    */
   async #handleUsage(replyThreadId: number | undefined): Promise<void> {
-    let stats: UsageStats;
     try {
-      stats = await this.#collectUsage();
+      await this.#updateUsagePanel(true);
     } catch (e) {
-      logError("usage collection failed", e);
-      await this.#send(replyThreadId, "⚠️ could not collect usage stats — see logs.");
+      logError("usage update failed", e);
+      await this.#send(replyThreadId, "⚠️ could not update the usage stats — see logs.");
       return;
     }
+    if (replyThreadId !== this.#usageTopic?.threadId) {
+      await this.#send(replyThreadId, "📊 usage stats updated.");
+    }
+  }
+
+  /** The hourly refresh tick: edit-only (never resurrects a deleted topic). */
+  async #refreshUsagePanel(): Promise<void> {
+    try {
+      await this.#loadUsageTopic();
+      if (!this.#usageTopic) return; // never ran /usage → nothing to refresh
+      await this.#updateUsagePanel(false);
+    } catch (e) {
+      logError("scheduled usage refresh failed", e);
+    }
+  }
+
+  /** Collect + render + deliver the stats panel. Throws on hard failure. */
+  async #updateUsagePanel(recreate: boolean): Promise<void> {
+    const stats = await this.#collectUsage();
     const live: LiveSessionUsage[] = [];
     for (const s of this.#store.list()) {
       const session = this.#sessions.get(s.threadId);
@@ -1152,23 +1183,16 @@ export class Bridge {
         ...(u ? { used: u.used, size: u.size } : {}),
       });
     }
-    const html = renderUsageRich(stats, live);
-
     await this.#loadUsageTopic();
-    try {
-      await this.#deliverUsage(html);
-    } catch (e) {
-      logError("usage delivery failed", e);
-      await this.#send(replyThreadId, "⚠️ could not update the usage topic — see logs.");
-      return;
-    }
-    if (replyThreadId !== this.#usageTopic?.threadId) {
-      await this.#send(replyThreadId, "📊 usage stats updated.");
-    }
+    await this.#deliverUsage(renderUsageRich(stats, live), recreate);
   }
 
-  /** Edit the stats message in place; (re)create the topic/message as needed. */
-  async #deliverUsage(html: string): Promise<void> {
+  /**
+   * Edit the stats message in place. With `recreate` the topic/message are
+   * (re)created as needed (`/usage`); without it a deleted topic just clears
+   * the pointer — the scheduler must not resurrect a topic the user deleted.
+   */
+  async #deliverUsage(html: string, recreate: boolean): Promise<void> {
     // Existing topic + message: try the in-place edit first.
     if (this.#usageTopic?.messageId !== undefined) {
       try {
@@ -1177,7 +1201,7 @@ export class Bridge {
       } catch (e) {
         if (e instanceof Error && /not modified/i.test(e.message)) return; // same content
         if (isThreadNotFound(e)) {
-          this.#usageTopic = undefined; // topic deleted → recreate below
+          this.#usageTopic = undefined; // topic deleted
         } else {
           // e.g. message deleted or too old to edit → send a fresh one below
           this.#usageTopic = { threadId: this.#usageTopic.threadId };
@@ -1185,6 +1209,10 @@ export class Bridge {
       }
     }
     if (!this.#usageTopic) {
+      if (!recreate) {
+        await this.#saveUsageTopic(); // persist the cleared pointer
+        return;
+      }
       const threadId = await this.#botApi.createForumTopic("📊 Claude Usage", ICON_COLORS[0]!);
       this.#usageTopic = { threadId };
     }
@@ -1195,8 +1223,13 @@ export class Bridge {
         .pinChatMessage(this.#usageTopic.threadId, messageId)
         .catch((e) => logError("usage pin failed", e));
     } catch (e) {
-      // The stored topic may itself be deleted → recreate once and retry.
+      // The stored topic may itself be deleted.
       if (!isThreadNotFound(e)) throw e;
+      if (!recreate) {
+        this.#usageTopic = undefined;
+        await this.#saveUsageTopic();
+        return;
+      }
       const threadId = await this.#botApi.createForumTopic("📊 Claude Usage", ICON_COLORS[0]!);
       this.#usageTopic = { threadId };
       const messageId = await this.#botApi.sendRich(threadId, html);

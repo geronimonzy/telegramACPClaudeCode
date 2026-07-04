@@ -168,18 +168,18 @@ export interface LiveSessionUsage {
   size?: number;
 }
 
-// Four columns max: Telegram renders rich tables at natural width and cuts
-// into horizontal scroll past the client width — a 5-column layout pushed the
-// last column off-screen on phones (live finding).
+// Three columns: Telegram renders rich tables at natural width and cuts into
+// horizontal scroll past the client width — 5 columns overflowed on phones,
+// and the cache column was dropped next (live feedback). cacheRead/cacheWrite
+// stay in ModelUsage for anyone who wants them back.
 function usageTable(map: Map<string, ModelUsage>): string {
   if (map.size === 0) return "<p>no usage</p>";
   const rows = [...map.entries()].sort((a, b) => b[1].output - a[1].output);
-  let t = "<table><tr><th>model</th><th>in/out</th><th>cache r/w</th><th>msgs</th></tr>";
+  let t = "<table><tr><th>model</th><th>in/out</th><th>msgs</th></tr>";
   for (const [model, u] of rows) {
     t +=
       `<tr><td>${escapeRich(model.replace(/^claude-/, ""))}</td>` +
       `<td>${fmtTokens(u.input)}/${fmtTokens(u.output)}</td>` +
-      `<td>${fmtTokens(u.cacheRead)}/${fmtTokens(u.cacheWrite)}</td>` +
       `<td>${u.messages}</td></tr>`;
   }
   return t + "</table>";

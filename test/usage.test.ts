@@ -123,8 +123,8 @@ describe("renderUsageRich", () => {
     );
     expect(html).toContain("<h3>📊 Claude usage</h3>");
     expect(html).toContain("<table>");
-    // 4 columns: model | in/out | cache r/w | msgs (5 overflowed on phones).
-    expect(html).toContain("<tr><th>model</th><th>in/out</th><th>cache r/w</th><th>msgs</th></tr>");
+    // 3 columns: model | in/out | msgs (wider layouts overflowed on phones).
+    expect(html).toContain("<tr><th>model</th><th>in/out</th><th>msgs</th></tr>");
     expect(html).toContain("opus-4-8"); // claude- prefix stripped
     expect(html).toContain("<td>100/10</td>"); // merged in/out cell
     expect(html).toContain("63.0k/200k");

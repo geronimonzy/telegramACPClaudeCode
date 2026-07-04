@@ -538,6 +538,49 @@ describe("Bridge", () => {
       const fresh = topics[1]!;
       expect(botApi.messages.some((m) => m.threadId === fresh.threadId)).toBe(true);
     });
+
+    it("refreshes the panel hourly after init, edit-only", async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, botApi } = makeBridge();
+        await bridge.init();
+        await bridge.handleMessage(undefined, { text: "/usage" });
+        const statsMsg = botApi.messages.find((m) => /Claude usage/.test(m.html))!;
+        const editsBefore = botApi.edits.length;
+
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+        const newEdits = botApi.edits.slice(editsBefore);
+        expect(newEdits.some((e) => e.messageId === statsMsg.messageId)).toBe(true);
+        // Edit-only: no extra topic or message was created.
+        expect(botApi.topics.filter((t) => /Claude Usage/.test(t.name))).toHaveLength(1);
+        await bridge.shutdown(); // clears the interval
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the scheduler does NOT resurrect a deleted usage topic", async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, botApi } = makeBridge();
+        await bridge.init();
+        await bridge.handleMessage(undefined, { text: "/usage" });
+        const topic = botApi.topics.find((t) => /Claude Usage/.test(t.name))!;
+        botApi.deadThreads.add(topic.threadId);
+
+        await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+
+        // Still just the one (dead) topic — no recreation from the timer.
+        expect(botApi.topics.filter((t) => /Claude Usage/.test(t.name))).toHaveLength(1);
+        // A later manual /usage recreates it.
+        await bridge.handleMessage(undefined, { text: "/usage" });
+        expect(botApi.topics.filter((t) => /Claude Usage/.test(t.name))).toHaveLength(2);
+        await bridge.shutdown();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("General topic accepts /new but refuses per-session commands", async () => {
