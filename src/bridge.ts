@@ -17,6 +17,7 @@ import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
 import { makeFsHandlers } from "./acp/fs-handlers.js";
+import { readSessionTurns, sessionFilePath } from "./acp/session-file.js";
 import { TerminalRegistry } from "./acp/terminals.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
@@ -986,8 +987,10 @@ export class Bridge {
 
     // Collect the suppressed replay into speaker TURNS (consecutive same-role
     // chunks merge). AgentSession routes every replay chunk to onReplayChunk
-    // during session/load, all before #spawnTopic resolves — so the whole
-    // history is in `turns` by the time the transcript is posted below.
+    // during session/load, all before #spawnTopic resolves. NOTE: this is only
+    // the FALLBACK transcript source — the adapter's replay is truncated for
+    // some sessions (its getSessionMessages stops after the first turn), so
+    // the session's own JSONL file is preferred below.
     const turns: Array<{ role: "user" | "agent"; text: string }> = [];
     const onReplayChunk = (u: acp.SessionUpdate): void => {
       let role: "user" | "agent";
@@ -1009,11 +1012,28 @@ export class Bridge {
       return { toast: "attach failed" };
     }
 
+    // Prefer the transcript from Claude Code's own session file: it is local,
+    // authoritative, and immune to the adapter's truncated replay. The replay
+    // turns win only when the file is missing/unreadable or somehow holds
+    // LESS than the replay delivered (format drift safety net).
+    let transcript = turns;
+    try {
+      const fileTurns = await readSessionTurns(
+        sessionFilePath(target.cwd, target.sessionId),
+      );
+      if (fileTurns.length >= turns.length) transcript = fileTurns;
+    } catch (e) {
+      log.warn(
+        { err: e, sessionId: target.sessionId },
+        "[bridge] session file unavailable; using adapter replay transcript",
+      );
+    }
+
     // Post the transcript ONE MESSAGE PER TURN — far more readable than one
     // rolled-over blob. User turns render as literal bold blockquotes, agent
     // turns as markdown under a 🤖 header; MessageDraft still owns rollover
     // for any single turn that exceeds the rich budget.
-    for (const turn of turns) {
+    for (const turn of transcript) {
       if (turn.text.trim() === "") continue;
       const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
         intervalMs: this.#cfg.editIntervalMs,
