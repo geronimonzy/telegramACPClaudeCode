@@ -89,6 +89,9 @@ function makeBotApi(bot: Bot, cfg: Config): BotApi {
         }),
       );
     },
+    async deleteMessage(messageId): Promise<void> {
+      await tgCall(() => bot.api.deleteMessage(chatId, messageId));
+    },
     async sendChatAction(threadId, action): Promise<void> {
       await tgCall(() =>
         bot.api.sendChatAction(chatId, action as "typing", {

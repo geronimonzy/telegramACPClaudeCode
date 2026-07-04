@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
-  buildProjectsKeyboard,
-  renderProjectsRich,
+  buildProjectKeyboard,
+  renderProjectRich,
+  renderProjectsHeader,
   shortenHome,
   topicDeepLink,
   PROJECTS_MAX_PER_GROUP,
@@ -45,21 +46,28 @@ describe("shortenHome", () => {
   });
 });
 
-describe("renderProjectsRich", () => {
-  it("renders projects, cwds, grouped session lines, balanced", () => {
-    const projects: ProjectView[] = [
-      {
-        name: "alpha",
-        cwd: "/home/kiril/alpha",
-        newKey: 1,
-        running: [{ title: "live one", threadId: 100 }],
-        disconnected: [{ title: "sleeping one", threadId: 101 }],
-        resumable: [{ title: "old one", attachKey: 2, date: "2026-07-03 18:00" }],
-      },
-    ];
-    const html = renderProjectsRich(projects, NOW);
+describe("renderProjectsHeader", () => {
+  it("renders the heading + updated line, balanced", () => {
+    const html = renderProjectsHeader(NOW);
     expect(html).toContain("<h3>📁 Projects</h3>");
     expect(html).toContain("updated 2026-07-04 12:00 UTC");
+    expect(isBalanced(html)).toBe(true);
+  });
+});
+
+describe("renderProjectRich", () => {
+  it("renders one project's name, cwd, grouped session lines, balanced", () => {
+    const p: ProjectView = {
+      name: "alpha",
+      cwd: "/home/kiril/alpha",
+      newKey: 1,
+      running: [{ title: "live one", threadId: 100 }],
+      disconnected: [{ title: "sleeping one", threadId: 101 }],
+      resumable: [{ title: "old one", attachKey: 2, date: "2026-07-03 18:00" }],
+    };
+    const html = renderProjectRich(p);
+    // The heading/updated line belongs to the header message, not per-project.
+    expect(html).not.toContain("<h3>📁 Projects</h3>");
     expect(html).toContain("<h4>alpha</h4>");
     expect(html).toContain("<code>/home/kiril/alpha</code>");
     expect(html).toContain("🟢 <b>live one</b>");
@@ -69,10 +77,14 @@ describe("renderProjectsRich", () => {
   });
 
   it("shows a 'no sessions' note for an empty project", () => {
-    const html = renderProjectsRich(
-      [{ name: "empty", cwd: "/x", newKey: 1, running: [], disconnected: [], resumable: [] }],
-      NOW,
-    );
+    const html = renderProjectRich({
+      name: "empty",
+      cwd: "/x",
+      newKey: 1,
+      running: [],
+      disconnected: [],
+      resumable: [],
+    });
     expect(html).toContain("<h4>empty</h4>");
     expect(html).toContain("no sessions");
     expect(isBalanced(html)).toBe(true);
@@ -83,10 +95,14 @@ describe("renderProjectsRich", () => {
       title: `s${i}`,
       attachKey: i + 1,
     }));
-    const html = renderProjectsRich(
-      [{ name: "big", cwd: "/x", newKey: 99, running: [], disconnected: [], resumable: many }],
-      NOW,
-    );
+    const html = renderProjectRich({
+      name: "big",
+      cwd: "/x",
+      newKey: 99,
+      running: [],
+      disconnected: [],
+      resumable: many,
+    });
     // Only the first N are shown; the rest collapse.
     expect(html).toContain("💤 <b>s0</b>");
     expect(html).toContain(`💤 <b>s${PROJECTS_MAX_PER_GROUP - 1}</b>`);
@@ -96,44 +112,31 @@ describe("renderProjectsRich", () => {
   });
 
   it("escapes interpolated names and cwds", () => {
-    const html = renderProjectsRich(
-      [
-        {
-          name: "a<b>",
-          cwd: "/p&q",
-          newKey: 1,
-          running: [{ title: "x<y>", threadId: 1 }],
-          disconnected: [],
-          resumable: [],
-        },
-      ],
-      NOW,
-    );
+    const html = renderProjectRich({
+      name: "a<b>",
+      cwd: "/p&q",
+      newKey: 1,
+      running: [{ title: "x<y>", threadId: 1 }],
+      disconnected: [],
+      resumable: [],
+    });
     expect(html).toContain("a&lt;b&gt;");
     expect(html).toContain("/p&amp;q");
     expect(html).toContain("x&lt;y&gt;");
   });
-
-  it("renders an empty overview", () => {
-    const html = renderProjectsRich([], NOW);
-    expect(html).toContain("No projects yet");
-    expect(isBalanced(html)).toBe(true);
-  });
 });
 
-describe("buildProjectsKeyboard", () => {
+describe("buildProjectKeyboard", () => {
   it("emits a proj:new button, url buttons for topics, proj:att for resumable", () => {
-    const projects: ProjectView[] = [
-      {
-        name: "alpha",
-        cwd: "/home/kiril/alpha",
-        newKey: 5,
-        running: [{ title: "live", threadId: 100 }],
-        disconnected: [{ title: "sleep", threadId: 101 }],
-        resumable: [{ title: "old", attachKey: 6 }],
-      },
-    ];
-    const kb = buildProjectsKeyboard(projects, -1001234567890);
+    const p: ProjectView = {
+      name: "alpha",
+      cwd: "/home/kiril/alpha",
+      newKey: 5,
+      running: [{ title: "live", threadId: 100 }],
+      disconnected: [{ title: "sleep", threadId: 101 }],
+      resumable: [{ title: "old", attachKey: 6 }],
+    };
+    const kb = buildProjectKeyboard(p, -1001234567890);
     const flat = kb.inline_keyboard.map((r) => r[0]!);
 
     const newBtn = flat[0]!;
@@ -156,8 +159,8 @@ describe("buildProjectsKeyboard", () => {
       title: `s${i}`,
       attachKey: i + 1,
     }));
-    const kb = buildProjectsKeyboard(
-      [{ name: "big", cwd: "/x", newKey: 1, running: [], disconnected: [], resumable: many }],
+    const kb = buildProjectKeyboard(
+      { name: "big", cwd: "/x", newKey: 1, running: [], disconnected: [], resumable: many },
       -100999,
     );
     const attachButtons = kb.inline_keyboard

@@ -32,8 +32,9 @@ import {
   type UsageStats,
 } from "./usage.js";
 import {
-  buildProjectsKeyboard,
-  renderProjectsRich,
+  buildProjectKeyboard,
+  renderProjectRich,
+  renderProjectsHeader,
   shortenHome,
   type ProjectSession,
   type ProjectView,
@@ -99,6 +100,8 @@ export interface BotApi {
    * `reply_markup` is omitted on an edit, so a panel refresh must ALWAYS pass it.
    */
   editRich(messageId: number, html: string, keyboard?: InlineKeyboard): Promise<void>;
+  /** Delete a message (identified chat-globally by message id). */
+  deleteMessage(messageId: number): Promise<void>;
   /** Emit a chat action (typing heartbeat) for a topic. */
   sendChatAction(threadId: number | undefined, action: string): Promise<void>;
   /** Upload a local file as a document into a topic. */
@@ -297,9 +300,13 @@ export class Bridge {
   #usageTimer: ReturnType<typeof setInterval> | undefined;
   readonly #collectUsage: () => Promise<UsageStats>;
 
-  // The 📁 Projects topic + its single edited overview message, persisted at
-  // {dataDir}/projects-topic.json so the topic is reused across restarts.
-  #projectsTopic: { threadId: number; messageId?: number } | undefined;
+  // The 📁 Projects topic: a pinned HEADER message plus ONE edited message PER
+  // project (keyed by cwd), persisted at {dataDir}/projects-topic.json so the
+  // topic + its messages are reused across restarts. A legacy `{threadId,
+  // messageId}` pointer (the old single-panel shape) is read as `headerId`.
+  #projectsTopic:
+    | { threadId: number; headerId?: number; byCwd?: Record<string, number> }
+    | undefined;
   #projectsTimer: ReturnType<typeof setInterval> | undefined;
   // Backlink targets from the LAST panel render, keyed by a monotonic counter
   // referenced by proj:new:{k} / proj:att:{k} callback_data (paths never go in
@@ -1532,7 +1539,16 @@ export class Bridge {
         raw !== null &&
         typeof (raw as { threadId?: unknown }).threadId === "number"
       ) {
-        this.#projectsTopic = raw as { threadId: number; messageId?: number };
+        const o = raw as { threadId: number; headerId?: number; byCwd?: Record<string, number>; messageId?: number };
+        // Legacy migration: the deployed single-panel bridge wrote `messageId`.
+        // Treat that old panel message as the header — it gets edited into header
+        // content on the next delivery, and the new shape is persisted on save.
+        const headerId = o.headerId ?? o.messageId;
+        this.#projectsTopic = {
+          threadId: o.threadId,
+          ...(headerId !== undefined ? { headerId } : {}),
+          byCwd: o.byCwd ?? {},
+        };
       }
     } catch {
       // missing/corrupt file → a fresh topic is created on demand
@@ -1546,10 +1562,11 @@ export class Bridge {
   }
 
   /**
-   * `/projects`: (re)build the 📁 Projects overview into its dedicated topic —
-   * ONE message, edited in place with its backlink keyboard (created + pinned on
-   * first use; recreated if the topic was deleted). A short confirmation goes to
-   * wherever the command was issued (unless that IS the projects topic).
+   * `/projects`: (re)build the 📁 Projects overview into its dedicated topic — a
+   * pinned header plus ONE message per project (each with its backlink keyboard),
+   * edited in place where possible (topic created on first use; recreated if it
+   * was deleted). A short confirmation goes to wherever the command was issued
+   * (unless that IS the projects topic).
    */
   async #handleProjects(replyThreadId: number | undefined): Promise<void> {
     try {
@@ -1584,14 +1601,12 @@ export class Bridge {
     void this.#refreshProjectsPanel().catch((e) => logError("projects poke failed", e));
   }
 
-  /** Collect + render + deliver the overview panel. Throws on hard failure. */
+  /** Collect + deliver the overview panel. Throws on hard failure. */
   async #updateProjectsPanel(recreate: boolean): Promise<void> {
     const resumable = await this.#listResumable(recreate);
     const projects = this.#buildProjects(resumable);
     await this.#loadProjectsTopic();
-    const html = renderProjectsRich(projects);
-    const keyboard = buildProjectsKeyboard(projects, this.#cfg.forumChatId);
-    await this.#deliverProjects(html, keyboard, recreate);
+    await this.#deliverProjects(projects, recreate);
   }
 
   /**
@@ -1691,56 +1706,107 @@ export class Bridge {
   }
 
   /**
-   * Edit the overview message in place (ALWAYS with its keyboard — Telegram drops
-   * an omitted reply_markup on edit). With `recreate` the topic/message are
-   * (re)created as needed (`/projects`); without it a deleted topic just clears
-   * the pointer. Mirrors {@link Bridge.#deliverUsage}.
+   * Reconcile the 📁 Projects topic: a pinned HEADER message plus ONE message
+   * PER project (keyed by cwd), edited in place where possible and sent/deleted
+   * to match `views`. With `recreate` the topic is (re)created as needed
+   * (`/projects`); without it a deleted topic just clears the whole pointer —
+   * the scheduler must not resurrect a topic the user deleted. `isThreadNotFound`
+   * anywhere in the flow means the topic itself is gone. Mirrors the
+   * edit-vs-send fallbacks of {@link Bridge.#deliverUsage}.
    */
-  async #deliverProjects(html: string, keyboard: InlineKeyboard, recreate: boolean): Promise<void> {
-    if (this.#projectsTopic?.messageId !== undefined) {
-      try {
-        await this.#botApi.editRich(this.#projectsTopic.messageId, html, keyboard);
-        return;
-      } catch (e) {
-        if (e instanceof Error && /not modified/i.test(e.message)) return; // same content
-        if (isThreadNotFound(e)) {
-          this.#projectsTopic = undefined; // topic deleted
-        } else {
-          // message deleted or too old to edit → send a fresh one below
-          this.#projectsTopic = { threadId: this.#projectsTopic.threadId };
-        }
-      }
-    }
+  async #deliverProjects(views: ProjectView[], recreate: boolean): Promise<void> {
+    const headerHtml = renderProjectsHeader();
+
+    // Ensure a topic exists. Without a pointer at all, only the manual
+    // /projects (recreate) may create one; a scheduled refresh just persists
+    // the (still-empty) pointer and bows out.
     if (!this.#projectsTopic) {
       if (!recreate) {
-        await this.#saveProjectsTopic(); // persist the cleared pointer
-        return;
-      }
-      const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
-      this.#projectsTopic = { threadId };
-    }
-    try {
-      const messageId = await this.#botApi.sendRich(this.#projectsTopic.threadId, html, keyboard);
-      this.#projectsTopic.messageId = messageId;
-      await this.#botApi
-        .pinChatMessage(this.#projectsTopic.threadId, messageId)
-        .catch((e) => logError("projects pin failed", e));
-    } catch (e) {
-      if (!isThreadNotFound(e)) throw e;
-      if (!recreate) {
-        this.#projectsTopic = undefined;
         await this.#saveProjectsTopic();
         return;
       }
       const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
-      this.#projectsTopic = { threadId };
-      const messageId = await this.#botApi.sendRich(threadId, html, keyboard);
-      this.#projectsTopic.messageId = messageId;
-      await this.#botApi
-        .pinChatMessage(threadId, messageId)
-        .catch((e2) => logError("projects pin failed", e2));
+      this.#projectsTopic = { threadId, byCwd: {} };
+    }
+
+    try {
+      await this.#reconcileProjects(views, headerHtml);
+    } catch (e) {
+      if (!isThreadNotFound(e)) throw e;
+      // The topic itself was deleted mid-flow → drop the WHOLE pointer.
+      this.#projectsTopic = undefined;
+      if (recreate) {
+        // Only the manual /projects rebuilds from scratch into a fresh topic.
+        const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
+        this.#projectsTopic = { threadId, byCwd: {} };
+        await this.#reconcileProjects(views, headerHtml);
+      }
     }
     await this.#saveProjectsTopic();
+  }
+
+  /**
+   * The single reconciliation pass over an existing #projectsTopic: header, then
+   * one message per project (in view order), then delete the messages of any
+   * project whose cwd vanished. Rethrows `isThreadNotFound` (topic gone) to the
+   * caller; swallows "not modified" and treats any other edit failure on a known
+   * message id as a deleted/too-old message → send a fresh one for it.
+   */
+  async #reconcileProjects(views: ProjectView[], headerHtml: string): Promise<void> {
+    const topic = this.#projectsTopic!;
+    const threadId = topic.threadId;
+    const byCwd = (topic.byCwd ??= {});
+
+    // Header: edit in place if known, else send + PIN (only the header is pinned;
+    // per-project messages are not).
+    if (topic.headerId !== undefined) {
+      try {
+        await this.#botApi.editRich(topic.headerId, headerHtml);
+      } catch (e) {
+        if (isThreadNotFound(e)) throw e;
+        // "not modified" is fine; anything else = message gone → resend below.
+        if (!(e instanceof Error && /not modified/i.test(e.message))) topic.headerId = undefined;
+      }
+    }
+    if (topic.headerId === undefined) {
+      const id = await this.#botApi.sendRich(threadId, headerHtml);
+      topic.headerId = id;
+      await this.#botApi
+        .pinChatMessage(threadId, id)
+        .catch((e) => logError("projects pin failed", e));
+    }
+
+    // Per project, in view order: edit its message in place, else send a fresh
+    // one. New projects therefore append at the bottom (acceptable).
+    const liveCwds = new Set<string>();
+    for (const p of views) {
+      liveCwds.add(p.cwd);
+      const html = renderProjectRich(p);
+      const keyboard = buildProjectKeyboard(p, this.#cfg.forumChatId);
+      const existing = byCwd[p.cwd];
+      if (existing !== undefined) {
+        try {
+          await this.#botApi.editRich(existing, html, keyboard);
+          continue;
+        } catch (e) {
+          if (isThreadNotFound(e)) throw e;
+          if (e instanceof Error && /not modified/i.test(e.message)) continue; // same content
+          delete byCwd[p.cwd]; // message deleted/too old → drop id, send fresh
+        }
+      }
+      byCwd[p.cwd] = await this.#botApi.sendRich(threadId, html, keyboard);
+    }
+
+    // Projects whose cwd vanished: delete their message (best-effort) and drop
+    // the map entry either way.
+    for (const cwd of Object.keys(byCwd)) {
+      if (liveCwds.has(cwd)) continue;
+      const id = byCwd[cwd]!;
+      delete byCwd[cwd];
+      await this.#botApi
+        .deleteMessage(id)
+        .catch((e) => logError("projects message delete failed", e));
+    }
   }
 
   /**

@@ -13,6 +13,7 @@ export class FakeBotApi implements BotApi {
   chatActions: Array<{ threadId: number | undefined; action: string }> = [];
   documents: Array<{ threadId: number; filePath: string; caption?: string }> = [];
   pins: Array<{ threadId: number | undefined; messageId: number }> = [];
+  deletions: number[] = [];
   closed: number[] = [];
   commands: Array<{ command: string; description: string }> | undefined;
 
@@ -23,6 +24,9 @@ export class FakeBotApi implements BotApi {
   /** Thread ids whose topic was "deleted": thread-scoped calls throw. */
   deadThreads = new Set<number>();
 
+  /** Message ids explicitly deleted: later edits of them throw like Telegram's. */
+  deletedMessages = new Set<number>();
+
   #nextThreadId = 100;
   #nextMessageId = 1;
 
@@ -32,8 +36,11 @@ export class FakeBotApi implements BotApi {
     }
   }
 
-  /** Deleting a topic deletes its messages: edits to them fail like Telegram's. */
+  /** Deleting a topic (or a message) deletes it: edits to it fail like Telegram's. */
   #throwIfMessageDead(messageId: number): void {
+    if (this.deletedMessages.has(messageId)) {
+      throw new Error("Bad Request: message to edit not found");
+    }
     const m = this.messages.find((x) => x.messageId === messageId);
     if (m && m.threadId !== undefined && this.deadThreads.has(m.threadId)) {
       throw new Error("Bad Request: message to edit not found");
@@ -78,6 +85,13 @@ export class FakeBotApi implements BotApi {
   async editRich(messageId: number, html: string, keyboard?: InlineKeyboard): Promise<void> {
     this.#throwIfMessageDead(messageId);
     this.edits.push({ messageId, html, keyboard });
+  }
+
+  async deleteMessage(messageId: number): Promise<void> {
+    this.deletions.push(messageId);
+    this.deletedMessages.add(messageId);
+    const i = this.messages.findIndex((x) => x.messageId === messageId);
+    if (i >= 0) this.messages.splice(i, 1);
   }
 
   async sendChatAction(threadId: number | undefined, action: string): Promise<void> {

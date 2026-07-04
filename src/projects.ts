@@ -68,6 +68,12 @@ export function topicDeepLink(forumChatId: number | string, threadId: number): s
   return `https://t.me/c/${internal}/${threadId}`;
 }
 
+/** Render the Projects HEADER (its own pinned message above the per-project ones). */
+export function renderProjectsHeader(now: Date = new Date()): string {
+  const when = now.toISOString().slice(0, 16).replace("T", " ");
+  return `<h3>📁 Projects</h3><p>updated ${when} UTC</p>`;
+}
+
 /** Render one project block (heading + cwd + grouped session list) as Rich HTML. */
 function projectBlock(p: ProjectView): string {
   const parts: string[] = [
@@ -95,47 +101,39 @@ function projectBlock(p: ProjectView): string {
   return parts.join("");
 }
 
-/** Render the whole Projects panel as Rich HTML. */
-export function renderProjectsRich(projects: ProjectView[], now: Date = new Date()): string {
-  const when = now.toISOString().slice(0, 16).replace("T", " ");
-  const parts: string[] = [`<h3>📁 Projects</h3><p>updated ${when} UTC</p>`];
-  if (projects.length === 0) {
-    parts.push("<p>No projects yet.</p>");
-    return parts.join("\n");
-  }
-  for (const p of projects) parts.push(projectBlock(p));
-  return parts.join("\n");
+/** Render ONE project as Rich HTML — its own message in the 📁 Projects topic. */
+export function renderProjectRich(p: ProjectView): string {
+  return projectBlock(p);
 }
 
 /**
- * Build the panel's inline keyboard (all rows single-button):
- *   - `➕ {name}` → `proj:new:{newKey}` per project;
+ * Build ONE project's inline keyboard (all rows single-button), for that
+ * project's own message:
+ *   - `➕ {name}` → `proj:new:{newKey}`;
  *   - a URL button deep-linking to each 🟢/🔌 session's topic;
  *   - `{title}` → `proj:att:{attachKey}` per 💤 resumable session.
  * Capped at {@link PROJECTS_MAX_PER_GROUP} sessions per state group, matching
- * what {@link renderProjectsRich} shows.
+ * what {@link renderProjectRich} shows.
  */
-export function buildProjectsKeyboard(
-  projects: ProjectView[],
+export function buildProjectKeyboard(
+  p: ProjectView,
   forumChatId: number | string,
 ): InlineKeyboard {
   const rows: InlineKeyboard["inline_keyboard"] = [];
-  for (const p of projects) {
-    rows.push([{ text: truncate(`➕ ${p.name}`, BUTTON_LABEL_MAX), callback_data: `proj:new:${p.newKey}` }]);
-    for (const s of p.running.slice(0, PROJECTS_MAX_PER_GROUP)) {
-      if (s.threadId !== undefined) {
-        rows.push([{ text: truncate(`🟢 ${s.title}`, BUTTON_LABEL_MAX), url: topicDeepLink(forumChatId, s.threadId) }]);
-      }
+  rows.push([{ text: truncate(`➕ ${p.name}`, BUTTON_LABEL_MAX), callback_data: `proj:new:${p.newKey}` }]);
+  for (const s of p.running.slice(0, PROJECTS_MAX_PER_GROUP)) {
+    if (s.threadId !== undefined) {
+      rows.push([{ text: truncate(`🟢 ${s.title}`, BUTTON_LABEL_MAX), url: topicDeepLink(forumChatId, s.threadId) }]);
     }
-    for (const s of p.disconnected.slice(0, PROJECTS_MAX_PER_GROUP)) {
-      if (s.threadId !== undefined) {
-        rows.push([{ text: truncate(`🔌 ${s.title}`, BUTTON_LABEL_MAX), url: topicDeepLink(forumChatId, s.threadId) }]);
-      }
+  }
+  for (const s of p.disconnected.slice(0, PROJECTS_MAX_PER_GROUP)) {
+    if (s.threadId !== undefined) {
+      rows.push([{ text: truncate(`🔌 ${s.title}`, BUTTON_LABEL_MAX), url: topicDeepLink(forumChatId, s.threadId) }]);
     }
-    for (const s of p.resumable.slice(0, PROJECTS_MAX_PER_GROUP)) {
-      if (s.attachKey !== undefined) {
-        rows.push([{ text: truncate(`💤 ${s.title}`, BUTTON_LABEL_MAX), callback_data: `proj:att:${s.attachKey}` }]);
-      }
+  }
+  for (const s of p.resumable.slice(0, PROJECTS_MAX_PER_GROUP)) {
+    if (s.attachKey !== undefined) {
+      rows.push([{ text: truncate(`💤 ${s.title}`, BUTTON_LABEL_MAX), callback_data: `proj:att:${s.attachKey}` }]);
     }
   }
   return { inline_keyboard: rows };

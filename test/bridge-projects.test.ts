@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSession } from "../src/acp/agent-session.js";
@@ -69,13 +69,28 @@ function urlOf(b: InlineKeyboardButton): string | undefined {
 function projectsTopic(botApi: FakeBotApi) {
   return botApi.topics.find((t) => /Projects/.test(t.name));
 }
-function projectsPanel(botApi: FakeBotApi) {
+/** All (live) messages in the Projects topic, oldest first. */
+function projectsMessages(botApi: FakeBotApi) {
   const t = projectsTopic(botApi)!;
-  return botApi.messages.find((m) => m.threadId === t.threadId)!;
+  return botApi.messages.filter((m) => m.threadId === t.threadId);
+}
+/** The pinned header message (the 📁 Projects heading + updated line). */
+function projectsHeader(botApi: FakeBotApi) {
+  return projectsMessages(botApi).find((m) => /<h3>📁 Projects<\/h3>/.test(m.html))!;
+}
+/** The per-project message for a given project display name. */
+function projectMsg(botApi: FakeBotApi, name: string) {
+  return projectsMessages(botApi).find((m) => m.html.includes(`<h4>${name}</h4>`))!;
+}
+/** The per-project message whose html contains a substring (the header excluded). */
+function projectMsgContaining(botApi: FakeBotApi, substr: string) {
+  return projectsMessages(botApi).find(
+    (m) => m.html.includes(substr) && !/<h3>📁 Projects<\/h3>/.test(m.html),
+  )!;
 }
 
 describe("/projects panel", () => {
-  it("creates + pins the topic and a keyboarded message; confirms to the caller", async () => {
+  it("creates + pins a header and one keyboarded message per project; confirms to the caller", async () => {
     const { bridge, botApi, cfg } = makeBridge();
     cfg.projects = { myproj: dir };
 
@@ -84,31 +99,103 @@ describe("/projects panel", () => {
     const topic = projectsTopic(botApi)!;
     expect(topic).toBeDefined();
     expect(topic.name).toBe("📁 Projects");
-    const panel = projectsPanel(botApi);
-    expect(panel.html).toContain("📁 Projects");
-    expect(panel.html).toContain("<h4>myproj</h4>");
+    // A pinned header message with the 📁 Projects heading (no per-project h4).
+    const header = projectsHeader(botApi);
+    expect(header.html).toContain("📁 Projects");
+    expect(header.html).not.toContain("<h4>");
+    expect(botApi.pins.some((p) => p.messageId === header.messageId)).toBe(true);
+    // One message per project, carrying that project's keyboard.
+    const panel = projectMsg(botApi, "myproj");
     expect(panel.keyboard).toBeDefined();
-    // Pinned.
-    expect(botApi.pins.some((p) => p.messageId === panel.messageId)).toBe(true);
-    // A proj:new button for the project.
+    // The header is not pinned-and-keyboarded; the project message holds proj:new.
     expect(buttons(panel.keyboard).map(cbData)).toContain("proj:new:" + 1);
     // Confirmation went to where the command was issued (General).
     expect(botApi.htmlFor(undefined).join("\n")).toContain("projects updated");
   });
 
-  it("a second /projects edits the same message in place, keyboard included", async () => {
-    const { bridge, botApi } = makeBridge();
+  it("a second /projects edits the same header + per-project messages in place, keyboards included", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
     await bridge.handleMessage(undefined, { text: "/projects" });
     const topic = projectsTopic(botApi)!;
-    const panel = projectsPanel(botApi);
+    const header = projectsHeader(botApi);
+    const panel = projectMsg(botApi, "myproj");
 
     await bridge.handleMessage(undefined, { text: "/projects" });
 
-    // Edited, not re-sent; and the edit carries the keyboard (Telegram drops it otherwise).
+    // Header edited in place (no keyboard on the header).
+    expect(botApi.edits.some((e) => e.messageId === header.messageId)).toBe(true);
+    // Per-project message edited, not re-sent; the edit carries the keyboard.
     const edit = botApi.edits.find((e) => e.messageId === panel.messageId);
     expect(edit).toBeDefined();
     expect(edit!.keyboard).toBeDefined();
-    expect(botApi.messages.filter((m) => m.threadId === topic.threadId)).toHaveLength(1);
+    // Still exactly header + one project message in the topic.
+    expect(botApi.messages.filter((m) => m.threadId === topic.threadId)).toHaveLength(2);
+  });
+
+  it("a project appearing later gets a new message without disturbing existing ones", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { alpha: join(dir, "alpha") };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const header = projectsHeader(botApi);
+    const alpha = projectMsg(botApi, "alpha");
+    const beforeCount = projectsMessages(botApi).length;
+
+    // Add a second project and refresh.
+    cfg.projects = { alpha: join(dir, "alpha"), beta: join(dir, "beta") };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // The new project got its own fresh message; the old ones were edited, not resent.
+    const beta = projectMsg(botApi, "beta");
+    expect(beta).toBeDefined();
+    expect(beta.messageId).not.toBe(alpha.messageId);
+    expect(projectsMessages(botApi).length).toBe(beforeCount + 1);
+    expect(botApi.edits.some((e) => e.messageId === alpha.messageId)).toBe(true);
+    expect(botApi.edits.some((e) => e.messageId === header.messageId)).toBe(true);
+    // No project message was deleted.
+    expect(botApi.deletions).toHaveLength(0);
+  });
+
+  it("a project disappearing deletes its message and drops it from the persisted pointer", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { alpha: join(dir, "alpha"), beta: join(dir, "beta") };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const beta = projectMsg(botApi, "beta");
+    expect(beta).toBeDefined();
+
+    // Remove beta and refresh.
+    cfg.projects = { alpha: join(dir, "alpha") };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // Beta's message was deleted and no longer lives in the topic.
+    expect(botApi.deletions).toContain(beta.messageId);
+    expect(projectMsg(botApi, "beta")).toBeUndefined();
+    // The persisted pointer no longer maps beta's cwd.
+    const pointer = JSON.parse(await readFile(join(dir, "projects-topic.json"), "utf-8"));
+    expect(Object.keys(pointer.byCwd ?? {})).not.toContain(join(dir, "beta"));
+    expect(Object.keys(pointer.byCwd ?? {})).toContain(join(dir, "alpha"));
+  });
+
+  it("a legacy {threadId, messageId} pointer is read as the header and upgraded on save", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
+    // Simulate the deployed single-panel bridge's pointer file + its message.
+    const legacyThread = await botApi.createForumTopic("📁 Projects", 0);
+    const legacyMsg = await botApi.sendRich(legacyThread, "<h3>📁 Projects</h3><p>old</p>");
+    await writeFile(
+      join(dir, "projects-topic.json"),
+      JSON.stringify({ threadId: legacyThread, messageId: legacyMsg }),
+    );
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // The old single message became the header, edited (not resent) into header content.
+    expect(botApi.edits.some((e) => e.messageId === legacyMsg)).toBe(true);
+    // The upgraded pointer carries headerId (the old messageId) + a byCwd map.
+    const pointer = JSON.parse(await readFile(join(dir, "projects-topic.json"), "utf-8"));
+    expect(pointer.headerId).toBe(legacyMsg);
+    expect(pointer.messageId).toBeUndefined();
+    expect(Object.keys(pointer.byCwd ?? {})).toContain(dir);
   });
 
   it("running sessions get a url button deep-linking to their topic", async () => {
@@ -118,7 +205,7 @@ describe("/projects panel", () => {
     const t1 = botApi.topics[0]!.threadId;
 
     await bridge.handleMessage(undefined, { text: "/projects" });
-    const panel = projectsPanel(botApi);
+    const panel = projectMsgContaining(botApi, "🟢");
     expect(panel.html).toContain("🟢");
 
     const runBtn = buttons(panel.keyboard).find((b) => b.text.startsWith("🟢"))!;
@@ -131,7 +218,7 @@ describe("/projects panel", () => {
     const { bridge, botApi, store, cfg } = makeBridge();
     cfg.projects = { myproj: dir };
     await bridge.handleMessage(undefined, { text: "/projects" });
-    const panel = projectsPanel(botApi);
+    const panel = projectMsg(botApi, "myproj");
     const newData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:new:"))!;
 
     const res = await bridge.handleCallback(newData, panel.messageId);
@@ -167,7 +254,7 @@ describe("/projects panel", () => {
     // No live session → manual /projects spawns a throwaway to list; the
     // resumable session's cwd becomes a project with a 💤 attach button.
     await bridge.handleMessage(undefined, { text: "/projects" });
-    const panel = projectsPanel(botApi);
+    const panel = projectMsgContaining(botApi, "💤 <b>Resume me</b>");
     expect(panel.html).toContain("💤 <b>Resume me</b>");
     const attData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:att:"))!;
     expect(attData).toBeDefined();
