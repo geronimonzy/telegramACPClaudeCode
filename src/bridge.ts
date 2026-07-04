@@ -11,13 +11,19 @@
 // every message send carries a message_thread_id (via BotApi, whose adapter
 // threads it through). All logic lives here — bot.ts is a thin adapter.
 
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
 import { makeFsHandlers } from "./acp/fs-handlers.js";
 import { readSessionTurns, sessionFilePath } from "./acp/session-file.js";
+import {
+  collectUsageStats,
+  renderUsageRich,
+  type LiveSessionUsage,
+  type UsageStats,
+} from "./usage.js";
 import { TerminalRegistry } from "./acp/terminals.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
@@ -111,6 +117,7 @@ function expandHome(p: string): string {
 export const COMMAND_LIST: Array<{ command: string; description: string }> = [
   { command: "new", description: "Start a session topic: /new [folder] [name…]" },
   { command: "sessions", description: "List resumable sessions to attach" },
+  { command: "usage", description: "Update the 📊 Claude Usage stats topic" },
   { command: "end", description: "End this session and close the topic" },
   { command: "cancel", description: "Cancel the in-flight turn" },
   { command: "mode", description: "Choose the agent mode" },
@@ -229,16 +236,23 @@ export class Bridge {
   // allow a duplicate attach.
   readonly #attaching = new Set<string>();
 
+  // The 📊 Claude Usage topic + its single edited stats message, persisted at
+  // {dataDir}/usage-topic.json so the topic is reused across restarts.
+  #usageTopic: { threadId: number; messageId?: number } | undefined;
+  readonly #collectUsage: () => Promise<UsageStats>;
+
   constructor(
     cfg: Config,
     botApi: BotApi,
     store: StateStore,
     startAgent: AgentStarter = AgentSession.start,
+    collectUsage: () => Promise<UsageStats> = () => collectUsageStats(),
   ) {
     this.#cfg = cfg;
     this.#botApi = botApi;
     this.#store = store;
     this.#startAgent = startAgent;
+    this.#collectUsage = collectUsage;
   }
 
   /**
@@ -410,6 +424,12 @@ export class Bridge {
     // `/sessions` works from any topic (the listing posts back into this one).
     if (cmd?.cmd === "sessions") {
       await this.#handleSessions(threadId);
+      return;
+    }
+
+    // `/usage` works from any topic (it updates the 📊 Claude Usage topic).
+    if (cmd?.cmd === "usage") {
+      await this.#handleUsage(threadId);
       return;
     }
 
@@ -1079,6 +1099,115 @@ export class Bridge {
     return { toast: "attached" };
   }
 
+  // --- /usage --------------------------------------------------------------
+
+  get #usageTopicFile(): string {
+    return path.join(this.#cfg.dataDir, "usage-topic.json");
+  }
+
+  async #loadUsageTopic(): Promise<void> {
+    if (this.#usageTopic) return;
+    try {
+      const raw = JSON.parse(await readFile(this.#usageTopicFile, "utf-8")) as unknown;
+      if (
+        typeof raw === "object" &&
+        raw !== null &&
+        typeof (raw as { threadId?: unknown }).threadId === "number"
+      ) {
+        this.#usageTopic = raw as { threadId: number; messageId?: number };
+      }
+    } catch {
+      // missing/corrupt file → a fresh topic is created on demand
+    }
+  }
+
+  async #saveUsageTopic(): Promise<void> {
+    await writeFile(this.#usageTopicFile, JSON.stringify(this.#usageTopic ?? null)).catch((e) =>
+      logError("usage-topic save failed", e),
+    );
+  }
+
+  /**
+   * `/usage`: aggregate token stats from the local Claude session files and
+   * render them into the dedicated 📊 Claude Usage topic — ONE stats message,
+   * edited in place on every refresh (created + pinned on first use; the
+   * topic is recreated if it was deleted). A short confirmation goes to
+   * wherever the command was issued (unless that IS the stats topic).
+   */
+  async #handleUsage(replyThreadId: number | undefined): Promise<void> {
+    let stats: UsageStats;
+    try {
+      stats = await this.#collectUsage();
+    } catch (e) {
+      logError("usage collection failed", e);
+      await this.#send(replyThreadId, "⚠️ could not collect usage stats — see logs.");
+      return;
+    }
+    const live: LiveSessionUsage[] = [];
+    for (const s of this.#store.list()) {
+      const session = this.#sessions.get(s.threadId);
+      const u = session?.lastUsage;
+      live.push({
+        title: s.title,
+        ...(u ? { used: u.used, size: u.size } : {}),
+      });
+    }
+    const html = renderUsageRich(stats, live);
+
+    await this.#loadUsageTopic();
+    try {
+      await this.#deliverUsage(html);
+    } catch (e) {
+      logError("usage delivery failed", e);
+      await this.#send(replyThreadId, "⚠️ could not update the usage topic — see logs.");
+      return;
+    }
+    if (replyThreadId !== this.#usageTopic?.threadId) {
+      await this.#send(replyThreadId, "📊 usage stats updated.");
+    }
+  }
+
+  /** Edit the stats message in place; (re)create the topic/message as needed. */
+  async #deliverUsage(html: string): Promise<void> {
+    // Existing topic + message: try the in-place edit first.
+    if (this.#usageTopic?.messageId !== undefined) {
+      try {
+        await this.#botApi.editRich(this.#usageTopic.messageId, html);
+        return;
+      } catch (e) {
+        if (e instanceof Error && /not modified/i.test(e.message)) return; // same content
+        if (isThreadNotFound(e)) {
+          this.#usageTopic = undefined; // topic deleted → recreate below
+        } else {
+          // e.g. message deleted or too old to edit → send a fresh one below
+          this.#usageTopic = { threadId: this.#usageTopic.threadId };
+        }
+      }
+    }
+    if (!this.#usageTopic) {
+      const threadId = await this.#botApi.createForumTopic("📊 Claude Usage", ICON_COLORS[0]!);
+      this.#usageTopic = { threadId };
+    }
+    try {
+      const messageId = await this.#botApi.sendRich(this.#usageTopic.threadId, html);
+      this.#usageTopic.messageId = messageId;
+      await this.#botApi
+        .pinChatMessage(this.#usageTopic.threadId, messageId)
+        .catch((e) => logError("usage pin failed", e));
+    } catch (e) {
+      // The stored topic may itself be deleted → recreate once and retry.
+      if (!isThreadNotFound(e)) throw e;
+      const threadId = await this.#botApi.createForumTopic("📊 Claude Usage", ICON_COLORS[0]!);
+      this.#usageTopic = { threadId };
+      const messageId = await this.#botApi.sendRich(threadId, html);
+      this.#usageTopic.messageId = messageId;
+      await this.#botApi
+        .pinChatMessage(threadId, messageId)
+        .catch((e2) => logError("usage pin failed", e2));
+    }
+    await this.#saveUsageTopic();
+  }
+
   // --- helpers -------------------------------------------------------------
 
   async #handleGeneral(msg: IncomingMsg): Promise<void> {
@@ -1089,6 +1218,10 @@ export class Bridge {
     }
     if (cmd?.cmd === "sessions") {
       await this.#handleSessions(undefined);
+      return;
+    }
+    if (cmd?.cmd === "usage") {
+      await this.#handleUsage(undefined);
       return;
     }
     await this.#send(

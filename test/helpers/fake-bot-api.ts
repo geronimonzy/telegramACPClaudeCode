@@ -32,6 +32,14 @@ export class FakeBotApi implements BotApi {
     }
   }
 
+  /** Deleting a topic deletes its messages: edits to them fail like Telegram's. */
+  #throwIfMessageDead(messageId: number): void {
+    const m = this.messages.find((x) => x.messageId === messageId);
+    if (m && m.threadId !== undefined && this.deadThreads.has(m.threadId)) {
+      throw new Error("Bad Request: message to edit not found");
+    }
+  }
+
   async createForumTopic(name: string, iconColor: number): Promise<number> {
     const threadId = this.#nextThreadId++;
     this.topics.push({ threadId, name, iconColor });
@@ -50,6 +58,7 @@ export class FakeBotApi implements BotApi {
   }
 
   async editMessageText(messageId: number, html: string): Promise<void> {
+    this.#throwIfMessageDead(messageId);
     this.edits.push({ messageId, html });
   }
 
@@ -67,6 +76,7 @@ export class FakeBotApi implements BotApi {
   }
 
   async editRich(messageId: number, html: string): Promise<void> {
+    this.#throwIfMessageDead(messageId);
     this.edits.push({ messageId, html });
   }
 

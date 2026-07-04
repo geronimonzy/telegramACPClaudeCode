@@ -51,7 +51,13 @@ function makeBridge(onAgent?: (a: MockAgent) => void) {
     onAgent?.(agent);
     return AgentSession.start({ ...opts, stream: clientStream, spawn: undefined });
   };
-  const bridge = new Bridge(cfg, botApi, store, starter);
+  const collectUsage = async () => ({
+    today: new Map([["claude-opus-4-8", { input: 100, output: 10, cacheRead: 5, cacheWrite: 2, messages: 1 }]]),
+    week: new Map([["claude-opus-4-8", { input: 500, output: 50, cacheRead: 25, cacheWrite: 10, messages: 5 }]]),
+    sessionsToday: 1,
+    sessionsWeek: 3,
+  });
+  const bridge = new Bridge(cfg, botApi, store, starter, collectUsage);
   return { bridge, botApi, store, mocks, cfg, agentStreams };
 }
 
@@ -489,6 +495,49 @@ describe("Bridge", () => {
       (m) => m.threadId === 888 && /disconnected/i.test(m.html) && m.keyboard,
     );
     expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
+  });
+
+  describe("/usage", () => {
+    it("creates the 📊 topic, posts + pins the stats message, persists across bridges", async () => {
+      const { bridge, botApi } = makeBridge();
+      await bridge.handleMessage(undefined, { text: "/usage" });
+
+      const topic = botApi.topics.find((t) => /Claude Usage/.test(t.name))!;
+      expect(topic).toBeDefined();
+      const statsMsg = botApi.messages.find((m) => m.threadId === topic.threadId)!;
+      expect(statsMsg.html).toContain("📊 Claude usage");
+      expect(statsMsg.html).toContain("<table>");
+      expect(statsMsg.html).toContain("opus-4-8");
+      expect(botApi.pins.some((p) => p.messageId === statsMsg.messageId)).toBe(true);
+      // Confirmation went to where the command was issued (General).
+      expect(botApi.htmlFor(undefined).join("\n")).toContain("usage stats updated");
+
+      // Second /usage EDITS the same message instead of sending a new one.
+      await bridge.handleMessage(undefined, { text: "/usage" });
+      expect(botApi.edits.some((e) => e.messageId === statsMsg.messageId)).toBe(true);
+      expect(botApi.messages.filter((m) => m.threadId === topic.threadId)).toHaveLength(1);
+
+      // A NEW bridge over the same dataDir reuses the persisted topic +
+      // message id: the stats land as an edit, and NO new topic is created.
+      const second = makeBridge();
+      await second.bridge.handleMessage(undefined, { text: "/usage" });
+      expect(second.botApi.topics.filter((t) => /Claude Usage/.test(t.name))).toHaveLength(0);
+      expect(second.botApi.edits.some((e) => e.html.includes("📊 Claude usage"))).toBe(true);
+    });
+
+    it("recreates the usage topic when it was deleted in Telegram", async () => {
+      const { bridge, botApi } = makeBridge();
+      await bridge.handleMessage(undefined, { text: "/usage" });
+      const topic = botApi.topics.find((t) => /Claude Usage/.test(t.name))!;
+      botApi.deadThreads.add(topic.threadId);
+
+      await bridge.handleMessage(undefined, { text: "/usage" });
+
+      const topics = botApi.topics.filter((t) => /Claude Usage/.test(t.name));
+      expect(topics).toHaveLength(2); // recreated
+      const fresh = topics[1]!;
+      expect(botApi.messages.some((m) => m.threadId === fresh.threadId)).toBe(true);
+    });
   });
 
   it("General topic accepts /new but refuses per-session commands", async () => {
