@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { AgentSession } from "../src/acp/agent-session.js";
@@ -57,7 +57,8 @@ function makeBridge(onAgent?: (a: MockAgent) => void) {
     sessionsToday: 1,
     sessionsWeek: 3,
   });
-  const bridge = new Bridge(cfg, botApi, store, starter, collectUsage);
+  // projectsDir = dir so tests can plant session JSONLs without touching ~.
+  const bridge = new Bridge(cfg, botApi, store, starter, collectUsage, dir);
   return { bridge, botApi, store, mocks, cfg, agentStreams };
 }
 
@@ -495,6 +496,69 @@ describe("Bridge", () => {
       (m) => m.threadId === 888 && /disconnected/i.test(m.html) && m.keyboard,
     );
     expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
+  });
+
+  describe("CLI mirror", () => {
+    const cliUser = (text: string): string =>
+      JSON.stringify({ type: "user", entrypoint: "cli", message: { role: "user", content: text } }) + "\n";
+    const cliAgent = (text: string): string =>
+      JSON.stringify({
+        type: "assistant",
+        entrypoint: "cli",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      }) + "\n";
+    const bridgeAgent = (text: string): string =>
+      JSON.stringify({
+        type: "assistant",
+        entrypoint: "telegram-acp-bridge",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      }) + "\n";
+
+    it("relays turns appended outside the bridge; baselines first; skips its own echo", async () => {
+      const { bridge, botApi, store } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+      expect(store.get(t1)?.acpSessionId).toBe("sess_mock_1");
+
+      // Plant the session file where the bridge's projectsDir override looks.
+      const projDir = join(dir, dir.replace(/[^a-zA-Z0-9]/g, "-"));
+      await mkdir(projDir, { recursive: true });
+      const fp = join(projDir, "sess_mock_1.jsonl");
+      await writeFile(fp, cliUser("old cli msg"));
+
+      // First pass BASELINES the cursor — pre-existing content is not posted.
+      await bridge.mirrorNow();
+      expect(store.get(t1)?.mirrorOffset).toBeGreaterThan(0);
+      expect(botApi.htmlFor(t1).join("\n")).not.toContain("old cli msg");
+
+      // The user picks the session up in the terminal.
+      await appendFile(
+        fp,
+        cliUser("hi from terminal") + cliAgent("terminal answer") + bridgeAgent("bridge echo"),
+      );
+      await bridge.mirrorNow();
+
+      const html = botApi.htmlFor(t1).join("\n");
+      expect(html).toContain("💻"); // mirroring notice
+      expect(html).toContain("hi from terminal");
+      expect(html).toContain("terminal answer");
+      expect(html).toContain("👤 You"); // rendered like an attach transcript
+      expect(html).not.toContain("bridge echo"); // own entries excluded
+
+      // Cursor advanced (past the excluded line too): a re-poll posts nothing.
+      const count = botApi.messages.length;
+      await bridge.mirrorNow();
+      expect(botApi.messages.length).toBe(count);
+    });
+
+    it("a session with no file yet is skipped without error", async () => {
+      const { bridge, botApi, store } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+      await bridge.mirrorNow();
+      expect(store.get(t1)?.mirrorOffset).toBeUndefined();
+      expect(botApi.htmlFor(t1).join("\n")).not.toContain("💻");
+    });
   });
 
   describe("adapter env", () => {

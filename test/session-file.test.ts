@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readSessionTurns, sessionFilePath } from "../src/acp/session-file.js";
+import { readNewTurns, readSessionTurns, sessionFilePath } from "../src/acp/session-file.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -110,6 +110,71 @@ describe("readSessionTurns", () => {
 
   it("throws when the file does not exist (caller falls back to replay)", async () => {
     await expect(readSessionTurns(join(dir, "missing.jsonl"))).rejects.toBeTruthy();
+  });
+});
+
+describe("readNewTurns", () => {
+  const userLine = (text: string, entrypoint = "cli"): string =>
+    L({ type: "user", entrypoint, message: { role: "user", content: text } });
+  const agentLine = (text: string, entrypoint = "cli"): string =>
+    L({
+      type: "assistant",
+      entrypoint,
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    });
+
+  it("reads only past the offset and filters excluded entrypoints", async () => {
+    const f = join(dir, "s.jsonl");
+    const old = userLine("already seen") + "\n";
+    await writeFile(f, old);
+    const offset = Buffer.byteLength(old);
+    await writeFile(
+      f,
+      old +
+        userLine("from cli") +
+        "\n" +
+        agentLine("cli answer") +
+        "\n" +
+        agentLine("bridge echo", "telegram-acp-bridge") +
+        "\n",
+    );
+
+    const { turns, nextOffset } = await readNewTurns(
+      f,
+      offset,
+      new Set(["telegram-acp-bridge", "sdk-ts"]),
+    );
+    expect(turns).toEqual([
+      { role: "user", text: "from cli" },
+      { role: "agent", text: "cli answer" },
+    ]);
+    // Cursor advanced past the excluded line too.
+    const { turns: again } = await readNewTurns(f, nextOffset, new Set(["telegram-acp-bridge"]));
+    expect(again).toEqual([]);
+  });
+
+  it("never consumes a trailing incomplete line", async () => {
+    const f = join(dir, "s.jsonl");
+    const complete = userLine("done") + "\n";
+    const partial = '{"type":"assistant","entrypoint":"cli","message":{"role":"assis'; // mid-write
+    await writeFile(f, complete + partial);
+
+    const r1 = await readNewTurns(f, 0);
+    expect(r1.turns).toEqual([{ role: "user", text: "done" }]);
+    expect(r1.nextOffset).toBe(Buffer.byteLength(complete));
+
+    // The writer finishes the line → the next poll picks it up.
+    await writeFile(f, complete + partial + 'tant","content":[{"type":"text","text":"late"}]}}\n');
+    const r2 = await readNewTurns(f, r1.nextOffset);
+    expect(r2.turns).toEqual([{ role: "agent", text: "late" }]);
+  });
+
+  it("returns empty with unchanged offset when nothing was appended", async () => {
+    const f = join(dir, "s.jsonl");
+    const content = userLine("x") + "\n";
+    await writeFile(f, content);
+    const size = Buffer.byteLength(content);
+    expect(await readNewTurns(f, size)).toEqual({ turns: [], nextOffset: size });
   });
 });
 

@@ -16,7 +16,7 @@
 // (subagent traffic). Everything else (`last-prompt`, `mode`, `attachment`,
 // `file-history-snapshot`, …) is metadata with no transcript value.
 
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 
@@ -62,13 +62,14 @@ function textsOf(content: unknown): string[] {
 }
 
 /**
- * Parse a session JSONL into speaker turns: real user/assistant prose in file
- * order, noise filtered (meta, sidechains, tool traffic, harness wrappers),
- * consecutive same-role texts merged into one turn. Throws if the file can't
- * be read; unparseable individual lines are skipped.
+ * Extract speaker turns from raw JSONL text: real user/assistant prose in
+ * file order, noise filtered (meta, sidechains, tool traffic, harness
+ * wrappers), consecutive same-role texts merged into one turn. Entries whose
+ * `entrypoint` is in `excludeEntrypoints` are dropped — the CLI-mirror uses
+ * this to skip entries the bridge itself produced. Unparseable lines are
+ * skipped.
  */
-export async function readSessionTurns(filePath: string): Promise<TranscriptTurn[]> {
-  const raw = await readFile(filePath, "utf-8");
+function extractTurns(raw: string, excludeEntrypoints?: Set<string>): TranscriptTurn[] {
   const turns: TranscriptTurn[] = [];
   for (const line of raw.split("\n")) {
     if (line.trim() === "") continue;
@@ -81,6 +82,12 @@ export async function readSessionTurns(filePath: string): Promise<TranscriptTurn
     if (!isRecord(o)) continue;
     if (o.type !== "user" && o.type !== "assistant") continue;
     if (o.isSidechain === true || o.isMeta === true) continue;
+    if (
+      excludeEntrypoints &&
+      typeof o.entrypoint === "string" &&
+      excludeEntrypoints.has(o.entrypoint)
+    )
+      continue;
     const msg = isRecord(o.message) ? o.message : undefined;
     for (const t of textsOf(msg?.content)) {
       const trimmed = t.trim();
@@ -93,4 +100,39 @@ export async function readSessionTurns(filePath: string): Promise<TranscriptTurn
     }
   }
   return turns;
+}
+
+/**
+ * Parse a whole session JSONL into speaker turns. Throws if the file can't
+ * be read.
+ */
+export async function readSessionTurns(filePath: string): Promise<TranscriptTurn[]> {
+  return extractTurns(await readFile(filePath, "utf-8"));
+}
+
+/**
+ * Incremental read for the CLI-mirror: parse the turns appended since byte
+ * `offset`, never consuming a trailing incomplete line (a writer may be
+ * mid-append — those bytes stay for the next poll). `nextOffset` advances to
+ * the end of the last complete line even when every entry was filtered out,
+ * so already-seen bytes are never re-read.
+ */
+export async function readNewTurns(
+  filePath: string,
+  offset: number,
+  excludeEntrypoints?: Set<string>,
+): Promise<{ turns: TranscriptTurn[]; nextOffset: number }> {
+  const fh = await open(filePath, "r");
+  try {
+    const size = (await fh.stat()).size;
+    if (size <= offset) return { turns: [], nextOffset: offset };
+    const buf = Buffer.alloc(size - offset);
+    await fh.read(buf, 0, buf.length, offset);
+    const lastNl = buf.lastIndexOf(0x0a); // "\n" is a self-synchronizing byte in UTF-8
+    if (lastNl === -1) return { turns: [], nextOffset: offset };
+    const raw = buf.subarray(0, lastNl + 1).toString("utf-8");
+    return { turns: extractTurns(raw, excludeEntrypoints), nextOffset: offset + lastNl + 1 };
+  } finally {
+    await fh.close();
+  }
 }

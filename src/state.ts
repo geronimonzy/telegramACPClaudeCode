@@ -8,6 +8,11 @@ export interface SessionState {
   cwd: string;
   title: string;
   createdAt: string; // ISO
+  /**
+   * How many bytes of the session's JSONL are already reflected in the topic
+   * (CLI-mirroring cursor). Absent until the first mirror poll baselines it.
+   */
+  mirrorOffset?: number;
 }
 
 export class StateStore {

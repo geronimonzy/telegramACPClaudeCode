@@ -17,7 +17,7 @@ import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
 import { makeFsHandlers } from "./acp/fs-handlers.js";
-import { readSessionTurns, sessionFilePath } from "./acp/session-file.js";
+import { readNewTurns, readSessionTurns, sessionFilePath } from "./acp/session-file.js";
 import {
   collectUsageStats,
   lastContextUsed,
@@ -109,6 +109,8 @@ const MAX_LISTED_SESSIONS = 10;
 const MAX_TITLE_LEN = 64;
 /** How often the 📊 Claude Usage panel refreshes itself (edit-only). */
 const USAGE_REFRESH_MS = 60 * 60 * 1000;
+/** How often the CLI-mirror tails stored sessions' JSONLs. */
+const MIRROR_POLL_MS = 15 * 1000;
 
 /** Display labels for the select config options the bridge exposes as commands. */
 const CONFIG_LABELS: Record<string, string> = { model: "Model", effort: "Effort" };
@@ -263,18 +265,38 @@ export class Bridge {
   #usageTimer: ReturnType<typeof setInterval> | undefined;
   readonly #collectUsage: () => Promise<UsageStats>;
 
+  // CLI-mirror: tail each stored session's JSONL and relay turns produced
+  // OUTSIDE the bridge (e.g. `claude /resume` on the machine) into its topic.
+  #mirrorTimer: ReturnType<typeof setInterval> | undefined;
+  #mirrorRunning = false;
+  readonly #mirrorExclude: Set<string>;
+  readonly #projectsDir: string | undefined;
+
   constructor(
     cfg: Config,
     botApi: BotApi,
     store: StateStore,
     startAgent: AgentStarter = AgentSession.start,
     collectUsage: () => Promise<UsageStats> = () => collectUsageStats(),
+    projectsDir?: string,
   ) {
     this.#cfg = cfg;
     this.#botApi = botApi;
     this.#store = store;
     this.#startAgent = startAgent;
     this.#collectUsage = collectUsage;
+    this.#projectsDir = projectsDir;
+    // Entries the bridge itself writes must never be mirrored back into the
+    // topic (they were already streamed live): the configured entrypoint plus
+    // "sdk-ts", which pre-entrypoint-fix bridge sessions were stamped with.
+    const ownEntrypoint =
+      { ...ADAPTER_ENV_DEFAULTS, ...cfg.adapterEnv }.CLAUDE_CODE_ENTRYPOINT ?? "sdk-ts";
+    this.#mirrorExclude = new Set([ownEntrypoint, "sdk-ts"]);
+  }
+
+  /** The session JSONL path, honoring the test override for the projects root. */
+  #sessionFile(cwd: string, sessionId: string): string {
+    return sessionFilePath(cwd, sessionId, this.#projectsDir);
   }
 
   /**
@@ -306,6 +328,11 @@ export class Bridge {
     // so the timer alone never keeps the process alive.
     this.#usageTimer = setInterval(() => void this.#refreshUsagePanel(), USAGE_REFRESH_MS);
     this.#usageTimer.unref?.();
+
+    // CLI-mirror poll: relay turns appended to a stored session's JSONL from
+    // outside the bridge (claude /resume on the machine) into its topic.
+    this.#mirrorTimer = setInterval(() => void this.mirrorNow(), MIRROR_POLL_MS);
+    this.#mirrorTimer.unref?.();
   }
 
   /**
@@ -512,6 +539,10 @@ export class Bridge {
     if (this.#usageTimer !== undefined) {
       clearInterval(this.#usageTimer);
       this.#usageTimer = undefined;
+    }
+    if (this.#mirrorTimer !== undefined) {
+      clearInterval(this.#mirrorTimer);
+      this.#mirrorTimer = undefined;
     }
     for (const session of this.#sessions.values()) {
       try {
@@ -1130,7 +1161,7 @@ export class Bridge {
     let transcript = turns;
     try {
       const fileTurns = await readSessionTurns(
-        sessionFilePath(target.cwd, target.sessionId),
+        this.#sessionFile(target.cwd, target.sessionId),
       );
       if (fileTurns.length >= turns.length) transcript = fileTurns;
     } catch (e) {
@@ -1140,20 +1171,7 @@ export class Bridge {
       );
     }
 
-    // Post the transcript ONE MESSAGE PER TURN — far more readable than one
-    // rolled-over blob. User turns render as literal bold blockquotes, agent
-    // turns as markdown under a 🤖 header; MessageDraft still owns rollover
-    // for any single turn that exceeds the rich budget.
-    for (const turn of transcript) {
-      if (turn.text.trim() === "") continue;
-      const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
-        intervalMs: this.#cfg.editIntervalMs,
-        maxLen: RICH_MAX_LEN,
-        render: turn.role === "user" ? renderUserTurnRich : renderAgentTurnRich,
-      });
-      draft.append(turn.text);
-      await draft.finalize();
-    }
+    await this.#postTranscript(threadId, transcript);
 
     const agent = session.agentSession;
     await this.#store.upsert({
@@ -1165,6 +1183,83 @@ export class Bridge {
     });
     await this.#send(threadId, "📎 attached — full history above; the session is live");
     return { toast: "attached" };
+  }
+
+  // --- CLI mirror ------------------------------------------------------------
+
+  /**
+   * One mirror pass over every stored session (public so tests — and anything
+   * wanting an immediate sync — can drive it without the timer). Single-flight:
+   * a pass still running when the next tick fires is not overlapped.
+   */
+  async mirrorNow(): Promise<void> {
+    if (this.#mirrorRunning) return;
+    this.#mirrorRunning = true;
+    try {
+      for (const s of this.#store.list()) {
+        try {
+          await this.#mirrorOne(s);
+        } catch (e) {
+          logError(`mirror failed for thread ${s.threadId}`, e);
+        }
+      }
+    } finally {
+      this.#mirrorRunning = false;
+    }
+  }
+
+  /**
+   * Tail one session's JSONL. The first sighting BASELINES the cursor at the
+   * current file size without posting anything — everything before that point
+   * is already in the topic (live streaming or the attach transcript). After
+   * that, appended entries produced outside the bridge (CLI resume) are
+   * rendered like an attach transcript; the bridge's own entries are excluded
+   * but still advance the cursor.
+   */
+  async #mirrorOne(s: SessionState): Promise<void> {
+    const fp = this.#sessionFile(s.cwd, s.acpSessionId);
+    let size: number;
+    try {
+      size = (await stat(fp)).size;
+    } catch {
+      return; // no session file yet (no turn ever ran) — nothing to mirror
+    }
+    if (s.mirrorOffset === undefined) {
+      await this.#store.upsert({ ...s, mirrorOffset: size });
+      return;
+    }
+    if (size <= s.mirrorOffset) return;
+    const { turns, nextOffset } = await readNewTurns(fp, s.mirrorOffset, this.#mirrorExclude);
+    if (turns.length > 0) {
+      await this.#send(s.threadId, "💻 <i>picked up outside Telegram — mirroring:</i>");
+      await this.#postTranscript(s.threadId, turns);
+    }
+    // Re-read the entry: a concurrent upsert (e.g. reconnect) may have changed
+    // other fields while we were posting.
+    const cur = this.#store.get(s.threadId);
+    if (cur) await this.#store.upsert({ ...cur, mirrorOffset: nextOffset });
+  }
+
+  /**
+   * Post transcript turns ONE MESSAGE PER TURN — user turns as literal bold
+   * blockquotes, agent turns as markdown under a 🤖 header; MessageDraft owns
+   * rollover for any single turn past the rich budget. Shared by the attach
+   * replay and the CLI mirror.
+   */
+  async #postTranscript(
+    threadId: number,
+    turns: Array<{ role: "user" | "agent"; text: string }>,
+  ): Promise<void> {
+    for (const turn of turns) {
+      if (turn.text.trim() === "") continue;
+      const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
+        intervalMs: this.#cfg.editIntervalMs,
+        maxLen: RICH_MAX_LEN,
+        render: turn.role === "user" ? renderUserTurnRich : renderAgentTurnRich,
+      });
+      draft.append(turn.text);
+      await draft.finalize();
+    }
   }
 
   // --- /usage --------------------------------------------------------------
@@ -1242,7 +1337,7 @@ export class Bridge {
         // No live usage_update (disconnected, or no turn yet this process):
         // recover the last-turn context from the session's own JSONL.
         try {
-          const fileUsed = await lastContextUsed(sessionFilePath(s.cwd, s.acpSessionId));
+          const fileUsed = await lastContextUsed(this.#sessionFile(s.cwd, s.acpSessionId));
           if (fileUsed !== undefined) entry.fileUsed = fileUsed;
         } catch {
           // no session file → leave the dash
