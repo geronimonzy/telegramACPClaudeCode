@@ -114,22 +114,27 @@ describe("/projects panel", () => {
     expect(botApi.htmlFor(undefined).join("\n")).toContain("projects updated");
   });
 
-  it("a second /projects edits the same header + per-project messages in place, keyboards included", async () => {
+  it("a second /projects with nothing changed edits ONLY the header (per-project edit is skipped)", async () => {
     const { bridge, botApi, cfg } = makeBridge();
     cfg.projects = { myproj: dir };
     await bridge.handleMessage(undefined, { text: "/projects" });
     const topic = projectsTopic(botApi)!;
     const header = projectsHeader(botApi);
     const panel = projectMsg(botApi, "myproj");
+    const editsBefore = botApi.edits.length;
 
     await bridge.handleMessage(undefined, { text: "/projects" });
 
-    // Header edited in place (no keyboard on the header).
+    // Header is exempt from the skip cache (its "updated …" timestamp always
+    // changes) and is edited every render.
     expect(botApi.edits.some((e) => e.messageId === header.messageId)).toBe(true);
-    // Per-project message edited, not re-sent; the edit carries the keyboard.
-    const edit = botApi.edits.find((e) => e.messageId === panel.messageId);
-    expect(edit).toBeDefined();
-    expect(edit!.keyboard).toBeDefined();
+    // The per-project message's content is byte-identical to last time, so the
+    // in-memory #projLastSent cache skips the Telegram call entirely — exactly
+    // one new edit this round, and it targets the header.
+    const newEdits = botApi.edits.slice(editsBefore);
+    expect(newEdits).toHaveLength(1);
+    expect(newEdits[0]!.messageId).toBe(header.messageId);
+    expect(newEdits.some((e) => e.messageId === panel.messageId)).toBe(false);
     // Still exactly header + one project message in the topic.
     expect(botApi.messages.filter((m) => m.threadId === topic.threadId)).toHaveLength(2);
   });
@@ -146,12 +151,14 @@ describe("/projects panel", () => {
     cfg.projects = { alpha: join(dir, "alpha"), beta: join(dir, "beta") };
     await bridge.handleMessage(undefined, { text: "/projects" });
 
-    // The new project got its own fresh message; the old ones were edited, not resent.
+    // The new project got its own fresh message; alpha's is untouched — same
+    // id, not resent, and not even re-edited since its content didn't change
+    // (the #projLastSent cache skips the no-op edit).
     const beta = projectMsg(botApi, "beta");
     expect(beta).toBeDefined();
     expect(beta.messageId).not.toBe(alpha.messageId);
     expect(projectsMessages(botApi).length).toBe(beforeCount + 1);
-    expect(botApi.edits.some((e) => e.messageId === alpha.messageId)).toBe(true);
+    expect(botApi.edits.some((e) => e.messageId === alpha.messageId)).toBe(false);
     expect(botApi.edits.some((e) => e.messageId === header.messageId)).toBe(true);
     // No project message was deleted.
     expect(botApi.deletions).toHaveLength(0);
@@ -400,6 +407,94 @@ describe("/projects panel", () => {
       vi.useRealTimers();
     }
   });
+
+  it("drops resumable sessions older than 30 days; keeps one with no updatedAt", async () => {
+    const oldCwd = join(dir, "ancient");
+    const undatedCwd = join(dir, "undated");
+    const stale = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    const { bridge, botApi } = makeBridge((a) => {
+      a.listSessionsResponse = [
+        { sessionId: "sess_old", cwd: oldCwd, title: "Ancient", updatedAt: stale },
+        { sessionId: "sess_undated", cwd: undatedCwd, title: "Undated" },
+      ];
+    });
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // The stale session's cwd never became a project — no message, no h4 for it.
+    expect(botApi.messages.some((m) => m.html.includes(oldCwd))).toBe(false);
+    // The session with no updatedAt (never hide what we can't date) IS listed.
+    const panel = projectMsgContaining(botApi, "💤 <b>Undated</b>");
+    expect(panel).toBeDefined();
+    expect(panel.html).toContain(`<code>${undatedCwd}</code>`);
+  });
+});
+
+describe("/projects edit-skip cache (#projLastSent)", () => {
+  it("a second /projects with nothing changed edits only the header", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const header = projectsHeader(botApi);
+    const panel = projectMsg(botApi, "myproj");
+    const editsBefore = botApi.edits.length;
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    const newEdits = botApi.edits.slice(editsBefore);
+    expect(newEdits).toHaveLength(1);
+    expect(newEdits[0]!.messageId).toBe(header.messageId);
+    expect(newEdits.some((e) => e.messageId === panel.messageId)).toBe(false);
+  });
+
+  it("when one project's content changes, only that project's message (plus the header) is edited", async () => {
+    const { bridge, botApi, cfg, store } = makeBridge();
+    cfg.projects = { alpha: join(dir, "alpha"), beta: join(dir, "beta") };
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const header = projectsHeader(botApi);
+    const alphaBefore = projectMsg(botApi, "alpha");
+    const betaBefore = projectMsg(botApi, "beta");
+
+    // Give beta a stored (disconnected) session — changes its rendered content;
+    // alpha is untouched.
+    await store.upsert({
+      threadId: 777,
+      acpSessionId: "sess_beta_1",
+      cwd: join(dir, "beta"),
+      title: "beta session",
+      createdAt: new Date().toISOString(),
+    });
+    const editsBefore = botApi.edits.length;
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    const newEdits = botApi.edits.slice(editsBefore);
+    const editedIds = new Set(newEdits.map((e) => e.messageId));
+    expect(editedIds.has(header.messageId)).toBe(true);
+    expect(editedIds.has(betaBefore.messageId)).toBe(true);
+    expect(editedIds.has(alphaBefore.messageId)).toBe(false);
+    expect(editedIds.size).toBe(2);
+  });
+
+  it("after a 'message is not modified' rejection, the next identical render skips the call", async () => {
+    // FakeBotApi doesn't simulate Telegram's "not modified" rejection, so this
+    // exercises the equivalent success-path priming instead: #projLastSent is
+    // populated on a normal successful edit exactly the same way it would be
+    // from a caught "not modified" error (see #reconcileProjects), so a THIRD
+    // identical render still finds the cache hit and skips.
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
+    await bridge.handleMessage(undefined, { text: "/projects" }); // send
+    const panel = projectMsg(botApi, "myproj");
+
+    await bridge.handleMessage(undefined, { text: "/projects" }); // primes cache (unchanged, skipped)
+    const editsBefore = botApi.edits.length;
+    await bridge.handleMessage(undefined, { text: "/projects" }); // still unchanged
+
+    expect(
+      botApi.edits.slice(editsBefore).some((e) => e.messageId === panel.messageId),
+    ).toBe(false);
+  });
 });
 
 /** The proj:att key encoded in a keyboard (undefined if it carries none). */
@@ -423,7 +518,7 @@ describe("/projects stable backlink keys", () => {
     updatedAt: "2026-07-03T18:00:00.000Z",
   };
 
-  it("consecutive renders keep identical callback_data on unchanged targets", async () => {
+  it("consecutive renders keep identical callback_data on unchanged targets (edit skipped, key stays live)", async () => {
     const { bridge, botApi, cfg } = makeBridge((a) => {
       a.listSessionsResponse = [{ ...RESUMABLE, cwd: dir }];
     });
@@ -435,10 +530,21 @@ describe("/projects stable backlink keys", () => {
     // Both a resumable-attach and a new-session button are present.
     expect(first.some((d) => d.startsWith("proj:att:"))).toBe(true);
     expect(first.some((d) => d.startsWith("proj:new:"))).toBe(true);
+    const editsBefore = botApi.edits.length;
 
     await bridge.handleMessage(undefined, { text: "/projects" });
-    const edit = botApi.edits.filter((e) => e.messageId === panel.messageId).at(-1)!;
-    expect(projData(edit.keyboard)).toEqual(first);
+
+    // Content unchanged → the #projLastSent cache skips the per-project edit
+    // entirely (only the header is edited every render).
+    expect(
+      botApi.edits.slice(editsBefore).some((e) => e.messageId === panel.messageId),
+    ).toBe(false);
+    // The key wasn't reallocated by the skipped render: the ORIGINAL
+    // callback_data still resolves.
+    const attData = first.find((d) => d.startsWith("proj:att:"))!;
+    const res = await bridge.handleCallback(attData, panel.messageId);
+    await tick();
+    expect(res?.toast).toBe("attached");
   });
 
   it("survives a restart: a proj:att tap from the pre-restart keyboard still attaches", async () => {

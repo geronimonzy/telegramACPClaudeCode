@@ -160,6 +160,13 @@ const USAGE_REFRESH_MS = 60 * 60 * 1000;
 const MIRROR_POLL_MS = 15 * 1000;
 /** Rows shown in one historical Activity panel before an "…and N more" row takes over. */
 const TOOLS_PANEL_MAX_ROWS = 30;
+/**
+ * Resumable sessions older than this are dropped from the 📁 Projects panel
+ * before grouping. Panel size directly costs Telegram flood budget (one
+ * message per project, ~20/min per group), so dead/stale projects shouldn't
+ * keep costing messages forever.
+ */
+const RESUMABLE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Display labels for the select config options the bridge exposes as commands. */
 const CONFIG_LABELS: Record<string, string> = { model: "Model", effort: "Effort" };
@@ -342,6 +349,13 @@ export class Bridge {
   #projSeq = 0;
   readonly #projTargets = new Map<number, ProjTarget>();
   readonly #projKeys = new Map<string, number>();
+  // In-memory cache of the last content actually delivered to each per-project
+  // message (messageId → html + serialized keyboard), so an unchanged render
+  // skips the Telegram call entirely instead of paying a roundtrip (and flood
+  // budget) for a rejected "message is not modified" edit. Never persisted — a
+  // restart just re-primes it with one no-op edit pass. The header is exempt
+  // (its "updated …" timestamp changes every render) and is never cached here.
+  readonly #projLastSent = new Map<number, string>();
   // Last successful resumable listing, kept warm so a timer/event refresh can
   // render a 💤 section WITHOUT spawning a throwaway adapter (that cost is only
   // acceptable for the manual /projects command).
@@ -1727,9 +1741,21 @@ export class Bridge {
     const stored = this.#store.list();
     const attachedIds = new Set(stored.map((s) => s.acpSessionId));
     // Same filter as #handleSessions: exclude ids already attached / attaching.
-    const freeResumable = resumable.filter(
-      (s) => !attachedIds.has(s.sessionId) && !this.#attaching.has(s.sessionId),
-    );
+    // Then drop resumables stale beyond RESUMABLE_MAX_AGE_MS — a session with no
+    // (or unparseable) updatedAt is kept, since we can't tell it's dead. This is
+    // the ONE place freeResumable is filtered, upstream of grouping/cwd-union, so
+    // keys/views/messages all agree on what's "still listed". Projects sourced
+    // from cfg.projects or stored sessions are unaffected — they never come from
+    // this list.
+    const now = Date.now();
+    const freeResumable = resumable
+      .filter((s) => !attachedIds.has(s.sessionId) && !this.#attaching.has(s.sessionId))
+      .filter((s) => {
+        if (!s.updatedAt) return true;
+        const t = Date.parse(s.updatedAt);
+        if (Number.isNaN(t)) return true;
+        return now - t <= RESUMABLE_MAX_AGE_MS;
+      });
 
     // A session in a `.claude/worktrees/{name}` cwd is folded into its parent
     // project for display (grouping only — proj:att keeps the real cwd below).
@@ -1836,8 +1862,10 @@ export class Bridge {
       await this.#reconcileProjects(views, headerHtml);
     } catch (e) {
       if (!isThreadNotFound(e)) throw e;
-      // The topic itself was deleted mid-flow → drop the WHOLE pointer.
+      // The topic itself was deleted mid-flow → drop the WHOLE pointer. Every
+      // message in it is gone too, so the send-cache can't be trusted either.
       this.#projectsTopic = undefined;
+      this.#projLastSent.clear();
       if (recreate) {
         // Only the manual /projects rebuilds from scratch into a fresh topic;
         // the already-built views keep their (still-live) backlink keys.
@@ -1886,24 +1914,36 @@ export class Bridge {
     }
 
     // Per project, in view order: edit its message in place, else send a fresh
-    // one. New projects therefore append at the bottom (acceptable).
+    // one. New projects therefore append at the bottom (acceptable). Skip the
+    // edit entirely when #projLastSent shows Telegram already holds this exact
+    // content — a no-op edit still costs a roundtrip (and flood budget).
     const liveCwds = new Set<string>();
     for (const p of views) {
       liveCwds.add(p.cwd);
       const html = renderProjectRich(p);
       const keyboard = buildProjectKeyboard(p, this.#cfg.forumChatId);
+      const sentKey = html + " " + JSON.stringify(keyboard ?? null);
       const existing = byCwd[p.cwd];
       if (existing !== undefined) {
+        if (this.#projLastSent.get(existing) === sentKey) continue; // unchanged
         try {
           await this.#botApi.editRich(existing, html, keyboard);
+          this.#projLastSent.set(existing, sentKey);
           continue;
         } catch (e) {
           if (isThreadNotFound(e)) throw e;
-          if (e instanceof Error && /not modified/i.test(e.message)) continue; // same content
+          if (e instanceof Error && /not modified/i.test(e.message)) {
+            // Telegram itself confirms it already holds this content.
+            this.#projLastSent.set(existing, sentKey);
+            continue;
+          }
           delete byCwd[p.cwd]; // message deleted/too old → drop id, send fresh
+          this.#projLastSent.delete(existing);
         }
       }
-      byCwd[p.cwd] = await this.#botApi.sendRich(threadId, html, keyboard);
+      const id = await this.#botApi.sendRich(threadId, html, keyboard);
+      byCwd[p.cwd] = id;
+      this.#projLastSent.set(id, sentKey);
     }
 
     // Projects whose cwd vanished: delete their message (best-effort) and drop
@@ -1912,6 +1952,7 @@ export class Bridge {
       if (liveCwds.has(cwd)) continue;
       const id = byCwd[cwd]!;
       delete byCwd[cwd];
+      this.#projLastSent.delete(id);
       await this.#botApi
         .deleteMessage(id)
         .catch((e) => logError("projects message delete failed", e));
