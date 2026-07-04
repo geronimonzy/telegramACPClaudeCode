@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collectUsageStats, fmtTokens, renderUsageRich } from "../src/usage.js";
+import { collectUsageStats, fmtTokens, lastContextUsed, renderUsageRich } from "../src/usage.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -79,6 +79,38 @@ describe("collectUsageStats", () => {
   });
 });
 
+describe("lastContextUsed", () => {
+  it("returns input+cache tokens of the LAST assistant entry, skipping sidechains", async () => {
+    const f = join(dir, "s.jsonl");
+    await writeFile(
+      f,
+      [
+        entry({ id: "m1", ts: "2026-07-04T09:00:00.000Z", input: 1000 }),
+        // sidechain traffic after it must not win
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          timestamp: "2026-07-04T11:00:00.000Z",
+          message: { id: "side", usage: { input_tokens: 999999 } },
+        }),
+        entry({ id: "m2", ts: "2026-07-04T10:00:00.000Z", input: 60000 }),
+      ].join("\n"),
+    );
+    // m2: 60000 input + 5 cacheRead + 2 cacheWrite (entry() defaults)
+    expect(await lastContextUsed(f)).toBe(60007);
+  });
+
+  it("returns undefined for a file with no usable usage", async () => {
+    const f = join(dir, "empty.jsonl");
+    await writeFile(f, JSON.stringify({ type: "user", message: { content: "hi" } }));
+    expect(await lastContextUsed(f)).toBeUndefined();
+  });
+
+  it("throws for a missing file", async () => {
+    await expect(lastContextUsed(join(dir, "nope.jsonl"))).rejects.toBeTruthy();
+  });
+});
+
 describe("fmtTokens", () => {
   it("formats k/M with exact small numbers", () => {
     expect(fmtTokens(999)).toBe("999");
@@ -116,8 +148,9 @@ describe("renderUsageRich", () => {
     const html = renderUsageRich(
       stats,
       [
-        { title: "bridge-work", used: 63000, size: 200000 },
-        { title: "no-usage-yet" },
+        { title: "bridge-work", connected: true, used: 63000, size: 200000 },
+        { title: "asleep-one", connected: false, fileUsed: 112000 },
+        { title: "no-usage-yet", connected: false },
       ],
       NOW,
     );
@@ -127,8 +160,9 @@ describe("renderUsageRich", () => {
     expect(html).toContain("<tr><th>model</th><th>in/out</th><th>msgs</th></tr>");
     expect(html).toContain("opus-4-8"); // claude- prefix stripped
     expect(html).toContain("<td>100/10</td>"); // merged in/out cell
-    expect(html).toContain("63.0k/200k");
-    expect(html).toContain("<b>no-usage-yet</b> — –");
+    expect(html).toContain("🟢 <b>bridge-work</b> — 63.0k/200k");
+    expect(html).toContain("🔌 <b>asleep-one</b> — ~112k ctx"); // recovered from file
+    expect(html).toContain("🔌 <b>no-usage-yet</b> — –");
     expect(isBalanced(html)).toBe(true);
   });
 

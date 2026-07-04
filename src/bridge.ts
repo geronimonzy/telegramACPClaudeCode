@@ -20,6 +20,7 @@ import { makeFsHandlers } from "./acp/fs-handlers.js";
 import { readSessionTurns, sessionFilePath } from "./acp/session-file.js";
 import {
   collectUsageStats,
+  lastContextUsed,
   renderUsageRich,
   type LiveSessionUsage,
   type UsageStats,
@@ -1178,10 +1179,22 @@ export class Bridge {
     for (const s of this.#store.list()) {
       const session = this.#sessions.get(s.threadId);
       const u = session?.lastUsage;
-      live.push({
+      const entry: LiveSessionUsage = {
         title: s.title,
+        connected: session !== undefined,
         ...(u ? { used: u.used, size: u.size } : {}),
-      });
+      };
+      if (!u) {
+        // No live usage_update (disconnected, or no turn yet this process):
+        // recover the last-turn context from the session's own JSONL.
+        try {
+          const fileUsed = await lastContextUsed(sessionFilePath(s.cwd, s.acpSessionId));
+          if (fileUsed !== undefined) entry.fileUsed = fileUsed;
+        } catch {
+          // no session file → leave the dash
+        }
+      }
+      live.push(entry);
     }
     await this.#loadUsageTopic();
     await this.#deliverUsage(renderUsageRich(stats, live), recreate);

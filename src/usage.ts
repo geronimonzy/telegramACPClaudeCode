@@ -161,11 +161,44 @@ export function fmtTokens(n: number): string {
   return String(n);
 }
 
-/** A live attached session's context line for the stats panel. */
+/**
+ * The context-at-last-turn for a session, from its JSONL: the LAST assistant
+ * entry's `input + cache_read + cache_creation` tokens ≈ what the model saw.
+ * Survives bridge restarts (unlike the in-memory usage_update cache), so
+ * disconnected sessions still show a real number. Throws if the file can't
+ * be read.
+ */
+export async function lastContextUsed(filePath: string): Promise<number | undefined> {
+  const raw = await readFile(filePath, "utf-8");
+  let last: number | undefined;
+  for (const line of raw.split("\n")) {
+    if (line === "" || !line.includes('"usage"')) continue;
+    let o: unknown;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(o) || o.type !== "assistant" || o.isSidechain === true) continue;
+    if (!isRecord(o.message) || !isRecord(o.message.usage)) continue;
+    const u = o.message.usage;
+    const used =
+      num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
+    if (used > 0) last = used;
+  }
+  return last;
+}
+
+/** An attached session's line in the stats panel. */
 export interface LiveSessionUsage {
   title: string;
+  /** Live agent subprocess attached right now (vs waiting for Reconnect). */
+  connected: boolean;
+  /** Context from a live usage_update (has the window size too). */
   used?: number;
   size?: number;
+  /** Context recovered from the session file when no live data exists. */
+  fileUsed?: number;
 }
 
 // Three columns: Telegram renders rich tables at natural width and cuts into
@@ -201,15 +234,19 @@ export function renderUsageRich(
   if (live.length > 0) {
     const items = live
       .map((s) => {
-        // "–" = no usage_update seen yet (no turn since this process started).
-        const ctx =
-          s.used !== undefined && s.size !== undefined
-            ? `${fmtTokens(s.used)}/${fmtTokens(s.size)}`
-            : "–";
-        return `<li><b>${escapeRich(s.title)}</b> — ${ctx}</li>`;
+        let ctx: string;
+        if (s.used !== undefined && s.size !== undefined) {
+          ctx = `${fmtTokens(s.used)}/${fmtTokens(s.size)}`;
+        } else if (s.fileUsed !== undefined) {
+          ctx = `~${fmtTokens(s.fileUsed)} ctx`;
+        } else {
+          ctx = "–";
+        }
+        const state = s.connected ? "🟢" : "🔌";
+        return `<li>${state} <b>${escapeRich(s.title)}</b> — ${ctx}</li>`;
       })
       .join("");
-    parts.push(`<h4>Live sessions</h4><ul>${items}</ul>`);
+    parts.push(`<h4>Sessions</h4><ul>${items}</ul>`);
   }
   return parts.join("\n");
 }
