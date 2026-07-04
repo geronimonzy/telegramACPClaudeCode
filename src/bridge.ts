@@ -439,6 +439,8 @@ export class Bridge {
     if (data.startsWith("perm:")) return this.#handlePermCallback(data, callbackMessageId);
     if (data.startsWith("mode:")) return this.#handleModeCallback(data, callbackMessageId);
     if (data.startsWith("reconnect:")) return this.#handleReconnectCallback(data);
+    if (data.startsWith("compact:")) return this.#handleCompactCallback(data, callbackMessageId);
+    if (data.startsWith("continue:")) return this.#handleContinueCallback(data, callbackMessageId);
     if (data.startsWith("restart:")) return this.#handleRestartCallback(data);
     if (data.startsWith("attach:")) return this.#handleAttachCallback(data);
     return undefined;
@@ -770,7 +772,18 @@ export class Bridge {
       const session = await this.#spawnTopic(threadId, stored.cwd, stored.acpSessionId);
       const agent = session.agentSession;
       if (agent.loaded) {
-        await this.#send(threadId, `🔌 <b>${escapeHtml(stored.title)}</b> — reconnected.`);
+        // Mirror the Claude Code TUI's resume choice: a restored session may
+        // carry a large context, so offer a one-tap /compact alongside plain
+        // continue. (Over ACP there is no such prompt from the agent itself —
+        // /compact is an ordinary advertised command we forward.)
+        await this.#send(threadId, `🔌 <b>${escapeHtml(stored.title)}</b> — reconnected.`, {
+          inline_keyboard: [
+            [
+              { text: "🧠 Compact", callback_data: `compact:${threadId}` },
+              { text: "▶️ Continue", callback_data: `continue:${threadId}` },
+            ],
+          ],
+        });
         return { toast: "reconnected" };
       }
       // loadSession failed; AgentSession fell back to a fresh session.
@@ -789,6 +802,46 @@ export class Bridge {
       );
       return { toast: "reconnect failed" };
     }
+  }
+
+  /**
+   * The post-reconnect "🧠 Compact" button: fire `/compact` into the session as
+   * an ordinary agent command. Deliberately NOT awaited — a compaction is a
+   * full prompt turn and can take a while; the callback must answer promptly,
+   * and the adapter streams "Compacting..." / "Compacting completed." into the
+   * topic as normal agent output.
+   */
+  async #handleCompactCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string }> {
+    const threadId = Number(data.slice("compact:".length));
+    const session = this.#sessions.get(threadId);
+    if (!session) return { toast: "no session" };
+    if (callbackMessageId !== undefined) {
+      await this.#botApi
+        .editMessageText(callbackMessageId, "🔌 reconnected — 🧠 compacting…")
+        .catch((e) => logError("compact edit failed", e));
+    }
+    void session
+      .handleUserPrompt([{ type: "text", text: "/compact" }])
+      .catch((e) => logError("compact prompt failed", e));
+    return { toast: "compacting" };
+  }
+
+  /** The post-reconnect "▶️ Continue" button: dismiss the choice, change nothing. */
+  async #handleContinueCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string }> {
+    const threadId = Number(data.slice("continue:".length));
+    if (!this.#store.get(threadId)) return { toast: "no session" };
+    if (callbackMessageId !== undefined) {
+      await this.#botApi
+        .editMessageText(callbackMessageId, "🔌 reconnected — continuing.")
+        .catch((e) => logError("continue edit failed", e));
+    }
+    return { toast: "continuing" };
   }
 
   async #handleRestartCallback(data: string): Promise<{ toast: string }> {

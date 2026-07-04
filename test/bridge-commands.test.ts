@@ -411,10 +411,46 @@ describe("Bridge", () => {
     expect(res?.toast).toBe("reconnected");
     expect(mocks).toHaveLength(1);
     expect(botApi.htmlFor(555).join("\n")).toContain("reconnected");
+    // The reconnected notice offers the compact-or-continue choice.
+    const notice = botApi.messages.find((m) => m.threadId === 555 && /reconnected/.test(m.html))!;
+    const row = notice.keyboard!.inline_keyboard[0]!;
+    expect(row.map((b) => b.callback_data)).toEqual(["compact:555", "continue:555"]);
     // Still usable: a text prompt now routes into the reconnected session.
     await bridge.handleMessage(555, { text: "ping" });
     expect(textOf(mocks[0]!)).toBe("ping");
     expect(store.get(555)?.acpSessionId).toBe("sess_mock_1");
+  });
+
+  it("post-reconnect Compact fires /compact into the session; Continue just dismisses", async () => {
+    const { bridge, botApi, mocks } = makeBridge();
+    const stored: SessionState = {
+      threadId: 555,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "restored-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+    await bridge.init();
+    await bridge.handleCallback("reconnect:555", undefined);
+    const notice = botApi.messages.find((m) => m.threadId === 555 && /reconnected/.test(m.html))!;
+
+    // Continue: edits the notice, sends nothing to the agent.
+    const cont = await bridge.handleCallback("continue:555", notice.messageId);
+    expect(cont?.toast).toBe("continuing");
+    expect(
+      botApi.edits.some((e) => e.messageId === notice.messageId && /continuing/.test(e.html)),
+    ).toBe(true);
+    expect(mocks[0]!.received).toHaveLength(0);
+
+    // Compact: edits the notice and forwards /compact as a prompt turn.
+    const comp = await bridge.handleCallback("compact:555", notice.messageId);
+    expect(comp?.toast).toBe("compacting");
+    await tick();
+    expect(textOf(mocks[0]!)).toBe("/compact");
+    expect(
+      botApi.edits.some((e) => e.messageId === notice.messageId && /compacting/.test(e.html)),
+    ).toBe(true);
   });
 
   it("Reconnect falls back to a fresh session when the stored id is unknown", async () => {
