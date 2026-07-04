@@ -36,6 +36,7 @@ import {
   renderProjectRich,
   renderProjectsHeader,
   shortenHome,
+  worktreeParent,
   type ProjectSession,
   type ProjectView,
 } from "./projects.js";
@@ -120,6 +121,20 @@ export interface BotApi {
 
 /** How the Bridge starts an AgentSession; overridden in tests to inject a stream. */
 export type AgentStarter = (opts: AgentSessionOptions) => Promise<AgentSession>;
+
+/**
+ * A 📁 Projects backlink target (see Bridge.#projTargets). Its `identity`
+ * (`new:{cwd}` / `att:{sessionId}`) is the STABLE key mapped to a small integer
+ * in callback_data — same identity ⇒ same integer forever.
+ */
+export type ProjTarget =
+  | { kind: "new"; cwd: string }
+  | { kind: "att"; sessionId: string; cwd: string; title: string };
+
+/** The stable identity of a backlink target (see {@link ProjTarget}). */
+function projIdentity(t: ProjTarget): string {
+  return t.kind === "new" ? `new:${t.cwd}` : `att:${t.sessionId}`;
+}
 
 /** An inbound Telegram message, normalized by the bot.ts adapter. */
 export interface IncomingMsg {
@@ -303,20 +318,30 @@ export class Bridge {
   // The 📁 Projects topic: a pinned HEADER message plus ONE edited message PER
   // project (keyed by cwd), persisted at {dataDir}/projects-topic.json so the
   // topic + its messages are reused across restarts. A legacy `{threadId,
-  // messageId}` pointer (the old single-panel shape) is read as `headerId`.
+  // messageId}` pointer (the old single-panel shape) is read as `headerId`. The
+  // `seq`/`targets` fields persist the backlink keys below (see #projTargets).
   #projectsTopic:
-    | { threadId: number; headerId?: number; byCwd?: Record<string, number> }
+    | {
+        threadId: number;
+        headerId?: number;
+        byCwd?: Record<string, number>;
+        seq?: number;
+        targets?: Record<string, ProjTarget>;
+      }
     | undefined;
   #projectsTimer: ReturnType<typeof setInterval> | undefined;
-  // Backlink targets from the LAST panel render, keyed by a monotonic counter
-  // referenced by proj:new:{k} / proj:att:{k} callback_data (paths never go in
-  // callback_data — 64-byte cap). Cleared + repopulated on every render; a tap
-  // whose key is gone answers "no longer listed" (exactly like #attachTargets).
+  // Backlink targets from the panel, keyed by a monotonic counter referenced by
+  // proj:new:{k} / proj:att:{k} callback_data (paths never go in callback_data —
+  // 64-byte cap). INVARIANT: a key is STABLE per target identity (`new:{cwd}` /
+  // `att:{sessionId}`) and survives restarts (persisted in projects-topic.json),
+  // so buttons on the persistent panel messages never go stale between renders
+  // or across a restart. #projKeys is the reverse index (identity → k) used to
+  // reuse a key; both maps are pruned of identities absent from a render, and a
+  // pruned key is never reissued (seq only ever grows). A tap whose key is gone
+  // answers "no longer listed".
   #projSeq = 0;
-  readonly #projTargets = new Map<
-    number,
-    { kind: "new"; cwd: string } | { kind: "att"; sessionId: string; cwd: string; title: string }
-  >();
+  readonly #projTargets = new Map<number, ProjTarget>();
+  readonly #projKeys = new Map<string, number>();
   // Last successful resumable listing, kept warm so a timer/event refresh can
   // render a 💤 section WITHOUT spawning a throwaway adapter (that cost is only
   // acceptable for the manual /projects command).
@@ -1551,7 +1576,14 @@ export class Bridge {
         raw !== null &&
         typeof (raw as { threadId?: unknown }).threadId === "number"
       ) {
-        const o = raw as { threadId: number; headerId?: number; byCwd?: Record<string, number>; messageId?: number };
+        const o = raw as {
+          threadId: number;
+          headerId?: number;
+          byCwd?: Record<string, number>;
+          messageId?: number;
+          seq?: number;
+          targets?: Record<string, ProjTarget>;
+        };
         // Legacy migration: the deployed single-panel bridge wrote `messageId`.
         // Treat that old panel message as the header — it gets edited into header
         // content on the next delivery, and the new shape is persisted on save.
@@ -1561,6 +1593,21 @@ export class Bridge {
           ...(headerId !== undefined ? { headerId } : {}),
           byCwd: o.byCwd ?? {},
         };
+        // Hydrate the backlink keys so buttons on the persistent panel messages
+        // still resolve after a restart (a tap can land before any re-render).
+        // Rebuild #projKeys from the targets' identities and float #projSeq above
+        // every loaded key so a fresh allocation never collides with a live one.
+        // This runs only on the FIRST real load (the early-return above), leaving
+        // in-memory state authoritative once the bridge is warm.
+        let maxK = o.seq ?? 0;
+        for (const [kStr, t] of Object.entries(o.targets ?? {})) {
+          const k = Number(kStr);
+          if (!Number.isFinite(k)) continue;
+          this.#projTargets.set(k, t);
+          this.#projKeys.set(projIdentity(t), k);
+          if (k > maxK) maxK = k;
+        }
+        this.#projSeq = Math.max(this.#projSeq, maxK);
       }
     } catch {
       // missing/corrupt file → a fresh topic is created on demand
@@ -1568,6 +1615,14 @@ export class Bridge {
   }
 
   async #saveProjectsTopic(): Promise<void> {
+    // Persist the current backlink keys alongside the pointer so taps on the
+    // panel's buttons keep resolving across a restart (see #projTargets).
+    if (this.#projectsTopic) {
+      this.#projectsTopic.seq = this.#projSeq;
+      this.#projectsTopic.targets = Object.fromEntries(
+        [...this.#projTargets].map(([k, t]) => [String(k), t]),
+      );
+    }
     await writeFile(this.#projectsTopicFile, JSON.stringify(this.#projectsTopic ?? null)).catch(
       (e) => logError("projects-topic save failed", e),
     );
@@ -1647,10 +1702,27 @@ export class Bridge {
    * with zero sessions), stored-session cwds, and free resumable-session cwds.
    * Order: cfg projects first (object order), then the rest alphabetically by
    * display name; within a project running → disconnected → resumable (newest
-   * first). Clears + repopulates #projTargets so stale taps miss.
+   * first). Backlink keys are STABLE per identity (see #projTargets): reused
+   * when the target reappears, freshly allocated otherwise, and pruned when it
+   * vanishes — so buttons on the persistent panel messages never go stale.
    */
   #buildProjects(resumable: acp.SessionInfo[]): ProjectView[] {
-    this.#projTargets.clear();
+    // Identities present in THIS render; both key maps are pruned to it below so
+    // vanished targets stop resolving while survivors keep their key.
+    const liveIdentities = new Set<string>();
+    // Reuse the target's existing key (same identity ⇒ same k forever) or mint a
+    // new one; refresh the stored Target so att titles/cwds can't drift stale.
+    const keyFor = (t: ProjTarget): number => {
+      const id = projIdentity(t);
+      liveIdentities.add(id);
+      let k = this.#projKeys.get(id);
+      if (k === undefined) {
+        k = ++this.#projSeq;
+        this.#projKeys.set(id, k);
+      }
+      this.#projTargets.set(k, t);
+      return k;
+    };
 
     const stored = this.#store.list();
     const attachedIds = new Set(stored.map((s) => s.acpSessionId));
@@ -1658,6 +1730,15 @@ export class Bridge {
     const freeResumable = resumable.filter(
       (s) => !attachedIds.has(s.sessionId) && !this.#attaching.has(s.sessionId),
     );
+
+    // A session in a `.claude/worktrees/{name}` cwd is folded into its parent
+    // project for display (grouping only — proj:att keeps the real cwd below).
+    const canonicalCwd = (cwd: string): string => worktreeParent(cwd)?.parent ?? cwd;
+    // Append a 🌿{name} marker to a worktree session's title, unchanged otherwise.
+    const foldedTitle = (cwd: string, title: string): string => {
+      const wt = worktreeParent(cwd);
+      return wt ? `${title} 🌿${wt.name}` : title;
+    };
 
     // Reverse cfg.projects (name → path) into path → display name (first wins).
     const pathToName = new Map<string, string>();
@@ -1669,8 +1750,8 @@ export class Bridge {
     const cfgPaths = [...new Set(Object.values(this.#cfg.projects))];
     const cfgSet = new Set(cfgPaths);
     const rest = new Set<string>();
-    for (const s of stored) if (!cfgSet.has(s.cwd)) rest.add(s.cwd);
-    for (const s of freeResumable) if (!cfgSet.has(s.cwd)) rest.add(s.cwd);
+    for (const s of stored) if (!cfgSet.has(canonicalCwd(s.cwd))) rest.add(canonicalCwd(s.cwd));
+    for (const s of freeResumable) if (!cfgSet.has(canonicalCwd(s.cwd))) rest.add(canonicalCwd(s.cwd));
     const orderedCwds = [
       ...cfgPaths,
       ...[...rest].sort((a, b) => displayName(a).localeCompare(displayName(b))),
@@ -1681,30 +1762,31 @@ export class Bridge {
       const running: ProjectSession[] = [];
       const disconnected: ProjectSession[] = [];
       for (const s of stored) {
-        if (s.cwd !== cwd) continue;
-        const line: ProjectSession = { title: s.title, threadId: s.threadId };
+        if (canonicalCwd(s.cwd) !== cwd) continue;
+        const line: ProjectSession = { title: foldedTitle(s.cwd, s.title), threadId: s.threadId };
         if (this.#sessions.has(s.threadId)) running.push(line);
         else disconnected.push(line);
       }
       const resumableLines: ProjectSession[] = freeResumable
-        .filter((s) => s.cwd === cwd)
+        .filter((s) => canonicalCwd(s.cwd) === cwd)
         .sort(
           (a, b) =>
             (b.updatedAt ? Date.parse(b.updatedAt) : 0) -
             (a.updatedAt ? Date.parse(a.updatedAt) : 0),
         )
         .map((s) => {
-          const k = ++this.#projSeq;
-          const title = (s.title ?? "").trim() || randomName();
-          this.#projTargets.set(k, { kind: "att", sessionId: s.sessionId, cwd, title });
+          const rawTitle = (s.title ?? "").trim() || randomName();
+          const title = foldedTitle(s.cwd, rawTitle);
+          // proj:att must carry the session's REAL cwd (the worktree path) —
+          // session/load needs it, even though the panel groups by the parent.
+          const k = keyFor({ kind: "att", sessionId: s.sessionId, cwd: s.cwd, title: rawTitle });
           const date = s.updatedAt
             ? new Date(s.updatedAt).toISOString().slice(0, 16).replace("T", " ")
             : undefined;
           return { title, attachKey: k, ...(date ? { date } : {}) };
         });
 
-      const newKey = ++this.#projSeq;
-      this.#projTargets.set(newKey, { kind: "new", cwd });
+      const newKey = keyFor({ kind: "new", cwd });
       views.push({
         name: displayName(cwd),
         cwd,
@@ -1713,6 +1795,15 @@ export class Bridge {
         disconnected,
         resumable: resumableLines,
       });
+    }
+
+    // Prune keys whose identity vanished from this render: their buttons now
+    // answer "no longer listed", and the freed keys are never reissued (seq only
+    // grows). Survivors keep their key so cached keyboards stay valid.
+    for (const [id, k] of this.#projKeys) {
+      if (liveIdentities.has(id)) continue;
+      this.#projKeys.delete(id);
+      this.#projTargets.delete(k);
     }
     return views;
   }
@@ -1748,10 +1839,16 @@ export class Bridge {
       // The topic itself was deleted mid-flow → drop the WHOLE pointer.
       this.#projectsTopic = undefined;
       if (recreate) {
-        // Only the manual /projects rebuilds from scratch into a fresh topic.
+        // Only the manual /projects rebuilds from scratch into a fresh topic;
+        // the already-built views keep their (still-live) backlink keys.
         const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
         this.#projectsTopic = { threadId, byCwd: {} };
         await this.#reconcileProjects(views, headerHtml);
+      } else {
+        // No rebuild → the panel and its buttons are gone; reset the now-dangling
+        // key maps so a later manual /projects starts clean (and save writes null).
+        this.#projTargets.clear();
+        this.#projKeys.clear();
       }
     }
     await this.#saveProjectsTopic();
@@ -1829,6 +1926,9 @@ export class Bridge {
    * the (per-render) target map answers a "no longer listed" toast.
    */
   async #handleProjectsCallback(data: string): Promise<{ toast: string }> {
+    // A tap can land after a restart before any /projects re-render — hydrate the
+    // persisted keys first (lazy + idempotent: a no-op once already loaded).
+    await this.#loadProjectsTopic();
     if (data.startsWith("proj:new:")) {
       const t = this.#projTargets.get(Number(data.slice("proj:new:".length)));
       if (!t || t.kind !== "new") return { toast: "no longer listed" };
@@ -1844,7 +1944,10 @@ export class Bridge {
       const k = Number(data.slice("proj:att:".length));
       const t = this.#projTargets.get(k);
       if (!t || t.kind !== "att") return { toast: "no longer listed" };
-      this.#projTargets.delete(k); // evict on use
+      // Evict on use from BOTH maps (guards double-attach alongside #attaching);
+      // the next render/save prunes it durably once the session is attached.
+      this.#projTargets.delete(k);
+      this.#projKeys.delete(projIdentity(t));
       this.#attaching.add(t.sessionId);
       try {
         return await this.#attachTarget({ sessionId: t.sessionId, cwd: t.cwd, title: t.title });

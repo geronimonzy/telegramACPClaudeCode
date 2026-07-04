@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSession } from "../src/acp/agent-session.js";
@@ -273,6 +274,88 @@ describe("/projects panel", () => {
     expect(entry?.title).toBe("Resume me");
   });
 
+  it("a resumable session in a .claude/worktrees cwd folds under its parent project; proj:att carries the real cwd", async () => {
+    const worktreeCwd = join(dir, ".claude", "worktrees", "android-app");
+    const { bridge, botApi, store } = makeBridge((a) => {
+      a.listSessionsResponse = [
+        {
+          // The mock agent's loadSession only accepts its own hardcoded
+          // MOCK_SESSION_ID ("sess_mock_1") — matches the existing "proj:att
+          // tap attaches..." test's convention above.
+          sessionId: "sess_mock_1",
+          cwd: worktreeCwd,
+          title: "Resume me",
+          updatedAt: "2026-07-03T18:00:00.000Z",
+        },
+      ];
+    });
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // No separate top-level project for the raw worktree path — just ONE
+    // project message total, keyed by the parent cwd.
+    expect(projectsMessages(botApi).filter((m) => /<h4>/.test(m.html))).toHaveLength(1);
+    const panel = projectMsgContaining(botApi, "💤 <b>Resume me 🌿android-app</b>");
+    expect(panel.html).toContain(`<code>${dir}</code>`);
+    expect(botApi.messages.some((m) => m.html.includes(worktreeCwd))).toBe(false);
+
+    const attData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:att:"))!;
+    const res = await bridge.handleCallback(attData!, panel.messageId);
+    await tick();
+
+    expect(res?.toast).toBe("attached");
+    // Attach used the session's REAL (worktree) cwd, not the folded parent —
+    // session/load needs the actual path.
+    const entry = store.list().find((s) => s.acpSessionId === "sess_mock_1");
+    expect(entry?.cwd).toBe(worktreeCwd);
+    expect(entry?.title).toBe("Resume me");
+  });
+
+  it("proj:new for a project with only folded worktree sessions creates a topic in the PARENT cwd", async () => {
+    const worktreeCwd = join(dir, ".claude", "worktrees", "android-app");
+    const { bridge, botApi, store } = makeBridge((a) => {
+      a.listSessionsResponse = [
+        {
+          sessionId: "sess_mock_1",
+          cwd: worktreeCwd,
+          title: "Resume me",
+          updatedAt: "2026-07-03T18:00:00.000Z",
+        },
+      ];
+    });
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsgContaining(botApi, "💤 <b>Resume me 🌿android-app</b>");
+    const newData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:new:"))!;
+
+    const res = await bridge.handleCallback(newData!, panel.messageId);
+    await tick();
+
+    expect(res?.toast).toBe("session created");
+    const sessionTopic = botApi.topics.find((t) => NAME_RE.test(t.name));
+    const entry = store.list().find((s) => s.threadId === sessionTopic!.threadId);
+    expect(entry?.cwd).toBe(dir); // parent cwd, not the worktree path
+  });
+
+  it("a stored (disconnected) session in a worktree cwd folds under its parent project", async () => {
+    const { bridge, botApi, store } = makeBridge();
+    const worktreeCwd = join(dir, ".claude", "worktrees", "android-app");
+    await store.upsert({
+      threadId: 555,
+      acpSessionId: "sess_stored_wt",
+      cwd: worktreeCwd,
+      title: "old worktree session",
+      createdAt: new Date().toISOString(),
+    });
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    const panel = projectMsgContaining(botApi, "🔌 <b>old worktree session 🌿android-app</b>");
+    expect(panel.html).toContain(`<code>${dir}</code>`);
+    // No separate top-level project for the raw worktree cwd.
+    expect(botApi.messages.some((m) => m.html.includes(worktreeCwd))).toBe(false);
+  });
+
   it("the hourly refresh is edit-only: no new topic, no throwaway agent spawn", async () => {
     vi.useFakeTimers();
     try {
@@ -316,5 +399,135 @@ describe("/projects panel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/** The proj:att key encoded in a keyboard (undefined if it carries none). */
+function attKeyIn(kb: InlineKeyboard | undefined): number | undefined {
+  const d = buttons(kb).map(cbData).find((x) => x?.startsWith("proj:att:"));
+  return d ? Number(d.slice("proj:att:".length)) : undefined;
+}
+/** All proj: callback_data in a keyboard, sorted for order-independent compare. */
+function projData(kb: InlineKeyboard | undefined): string[] {
+  return buttons(kb)
+    .map(cbData)
+    .filter((d): d is string => !!d?.startsWith("proj:"))
+    .sort();
+}
+
+describe("/projects stable backlink keys", () => {
+  const RESUMABLE = {
+    sessionId: "sess_mock_1",
+    cwd: "/home/kiril/proj",
+    title: "Resume me",
+    updatedAt: "2026-07-03T18:00:00.000Z",
+  };
+
+  it("consecutive renders keep identical callback_data on unchanged targets", async () => {
+    const { bridge, botApi, cfg } = makeBridge((a) => {
+      a.listSessionsResponse = [{ ...RESUMABLE, cwd: dir }];
+    });
+    cfg.projects = { myproj: dir };
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsg(botApi, "myproj");
+    const first = projData(panel.keyboard);
+    // Both a resumable-attach and a new-session button are present.
+    expect(first.some((d) => d.startsWith("proj:att:"))).toBe(true);
+    expect(first.some((d) => d.startsWith("proj:new:"))).toBe(true);
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const edit = botApi.edits.filter((e) => e.messageId === panel.messageId).at(-1)!;
+    expect(projData(edit.keyboard)).toEqual(first);
+  });
+
+  it("survives a restart: a proj:att tap from the pre-restart keyboard still attaches", async () => {
+    const first = makeBridge((a) => {
+      a.listSessionsResponse = [RESUMABLE];
+    });
+    await first.bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsgContaining(first.botApi, "💤 <b>Resume me</b>");
+    const attData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:att:"))!;
+
+    // Restart: a fresh Bridge over the SAME dataDir, without running /projects.
+    const second = makeBridge();
+    const before = second.botApi.topics.length;
+    const res = await second.bridge.handleCallback(attData!, panel.messageId);
+    await tick();
+
+    expect(res?.toast).toBe("attached");
+    expect(second.botApi.topics.length).toBe(before + 1);
+    expect(second.botApi.topics.at(-1)!.name).toBe("Resume me");
+    const entry = second.store.list().find((s) => s.acpSessionId === "sess_mock_1");
+    expect(entry?.cwd).toBe("/home/kiril/proj");
+  });
+
+  it("survives a restart: a proj:new tap from the pre-restart keyboard still creates a session", async () => {
+    const first = makeBridge();
+    first.cfg.projects = { myproj: dir };
+    await first.bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsg(first.botApi, "myproj");
+    const newData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:new:"))!;
+
+    const second = makeBridge();
+    const res = await second.bridge.handleCallback(newData!, panel.messageId);
+    await tick();
+
+    expect(res?.toast).toBe("session created");
+    const sessionTopic = second.botApi.topics.find((t) => NAME_RE.test(t.name));
+    expect(sessionTopic).toBeDefined();
+    const entry = second.store.list().find((s) => s.threadId === sessionTopic!.threadId);
+    expect(entry?.cwd).toBe(dir);
+  });
+
+  it("a vanished target is pruned from the persisted file and its old key answers 'no longer listed'", async () => {
+    let resumables = [{ ...RESUMABLE, cwd: dir }];
+    const { bridge, botApi, cfg } = makeBridge((a) => {
+      a.listSessionsResponse = resumables;
+    });
+    cfg.projects = { myproj: dir };
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsgContaining(botApi, "💤 <b>Resume me</b>");
+    const attData = buttons(panel.keyboard).map(cbData).find((d) => d?.startsWith("proj:att:"))!;
+    const persisted = () => JSON.parse(readFileSync(join(dir, "projects-topic.json"), "utf-8"));
+    // The att target was persisted on the first delivery.
+    const before = Object.values(persisted().targets ?? {}) as Array<{ kind: string }>;
+    expect(before.some((t) => t.kind === "att")).toBe(true);
+
+    // The resumable session vanishes; the next render prunes its target.
+    resumables = [];
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    const after = Object.values(persisted().targets ?? {}) as Array<{ kind: string }>;
+    expect(after.some((t) => t.kind === "att")).toBe(false);
+    const res = await bridge.handleCallback(attData!, panel.messageId);
+    expect(res?.toast).toMatch(/no longer listed/);
+  });
+
+  it("a re-appearing target gets a fresh key greater than the pruned one (seq never reuses)", async () => {
+    let resumables = [{ ...RESUMABLE, cwd: dir }];
+    const { bridge, botApi, cfg } = makeBridge((a) => {
+      a.listSessionsResponse = resumables;
+    });
+    cfg.projects = { myproj: dir };
+
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    const panel = projectMsg(botApi, "myproj");
+    const key1 = attKeyIn(panel.keyboard)!;
+    expect(key1).toBeGreaterThan(0);
+
+    // Vanish (prune), then re-appear.
+    resumables = [];
+    await bridge.handleMessage(undefined, { text: "/projects" });
+    resumables = [{ ...RESUMABLE, cwd: dir }];
+    await bridge.handleMessage(undefined, { text: "/projects" });
+
+    // The re-render edited the same message with a re-attach button; its key must
+    // be a freshly minted one, strictly greater than the pruned key.
+    const reEdit = botApi.edits
+      .filter((e) => e.messageId === panel.messageId && attKeyIn(e.keyboard) !== undefined)
+      .at(-1)!;
+    expect(attKeyIn(reEdit.keyboard)!).toBeGreaterThan(key1);
   });
 });

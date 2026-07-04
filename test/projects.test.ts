@@ -5,6 +5,7 @@ import {
   renderProjectsHeader,
   shortenHome,
   topicDeepLink,
+  worktreeParent,
   PROJECTS_MAX_PER_GROUP,
   type ProjectView,
 } from "../src/projects.js";
@@ -43,6 +44,31 @@ describe("shortenHome", () => {
     expect(shortenHome("/home/kiril/proj", "/home/kiril")).toBe("~/proj");
     expect(shortenHome("/home/kiril", "/home/kiril")).toBe("~");
     expect(shortenHome("/opt/other", "/home/kiril")).toBe("/opt/other");
+  });
+});
+
+describe("worktreeParent", () => {
+  it("matches a Claude Code worktree cwd and extracts parent + name", () => {
+    expect(worktreeParent("/home/kiril/receiptSaas/.claude/worktrees/android-app")).toEqual({
+      parent: "/home/kiril/receiptSaas",
+      name: "android-app",
+    });
+  });
+
+  it("rejects a plain project cwd", () => {
+    expect(worktreeParent("/home/kiril/receiptSaas")).toBeUndefined();
+  });
+
+  it("rejects a trailing slash after the worktree name", () => {
+    expect(
+      worktreeParent("/home/kiril/receiptSaas/.claude/worktrees/android-app/"),
+    ).toBeUndefined();
+  });
+
+  it("rejects a nested path under the worktree (not the worktree root itself)", () => {
+    expect(
+      worktreeParent("/home/kiril/receiptSaas/.claude/worktrees/android-app/src"),
+    ).toBeUndefined();
   });
 });
 

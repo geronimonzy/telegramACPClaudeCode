@@ -55,6 +55,20 @@ export function shortenHome(p: string, home: string = homedir()): string {
 }
 
 /**
+ * If `cwd` is a Claude Code worktree the harness creates under a project
+ * (`{parent}/.claude/worktrees/{name}`), return its parent project cwd and
+ * worktree name so the Projects panel can fold its sessions into the parent
+ * project instead of listing the worktree as its own top-level project.
+ * Returns undefined for any other shape (a trailing slash after `{name}`
+ * doesn't match, since `[^/]+` requires a slash-free final segment).
+ */
+export function worktreeParent(cwd: string): { parent: string; name: string } | undefined {
+  const m = /^(.+)\/\.claude\/worktrees\/([^/]+)$/.exec(cwd);
+  if (!m) return undefined;
+  return { parent: m[1], name: m[2] };
+}
+
+/**
  * The Telegram deep-link to a forum topic: `https://t.me/c/{internal}/{threadId}`
  * where `internal` is the supergroup chat id with its leading `-100` stripped.
  *
