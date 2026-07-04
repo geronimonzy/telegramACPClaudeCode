@@ -9,7 +9,7 @@ export class FakeBotApi implements BotApi {
     keyboard?: InlineKeyboard;
     messageId: number;
   }> = [];
-  edits: Array<{ messageId: number; html: string }> = [];
+  edits: Array<{ messageId: number; html: string; keyboard?: InlineKeyboard }> = [];
   chatActions: Array<{ threadId: number | undefined; action: string }> = [];
   documents: Array<{ threadId: number; filePath: string; caption?: string }> = [];
   pins: Array<{ threadId: number | undefined; messageId: number }> = [];
@@ -75,9 +75,9 @@ export class FakeBotApi implements BotApi {
     return messageId;
   }
 
-  async editRich(messageId: number, html: string): Promise<void> {
+  async editRich(messageId: number, html: string, keyboard?: InlineKeyboard): Promise<void> {
     this.#throwIfMessageDead(messageId);
-    this.edits.push({ messageId, html });
+    this.edits.push({ messageId, html, keyboard });
   }
 
   async sendChatAction(threadId: number | undefined, action: string): Promise<void> {

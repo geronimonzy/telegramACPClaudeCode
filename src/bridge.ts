@@ -25,6 +25,13 @@ import {
   type LiveSessionUsage,
   type UsageStats,
 } from "./usage.js";
+import {
+  buildProjectsKeyboard,
+  renderProjectsRich,
+  shortenHome,
+  type ProjectSession,
+  type ProjectView,
+} from "./projects.js";
 import { TerminalRegistry } from "./acp/terminals.js";
 import type { Config } from "./config.js";
 import { escapeHtml } from "./html.js";
@@ -41,9 +48,19 @@ import { randomName } from "./telegram/names.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import type { MessageApi } from "./telegram/live-message.js";
 
+/**
+ * One inline-keyboard button: either a callback button (`callback_data`) or a
+ * URL button (`url`). The Projects panel uses `url` buttons to deep-link into a
+ * session's forum topic; every other keyboard uses `callback_data`. Read sites
+ * narrow with `"callback_data" in btn`.
+ */
+export type InlineKeyboardButton =
+  | { text: string; callback_data: string }
+  | { text: string; url: string };
+
 /** An inline keyboard, in Telegram's `inline_keyboard` shape. */
 export interface InlineKeyboard {
-  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  inline_keyboard: InlineKeyboardButton[][];
 }
 
 /**
@@ -68,8 +85,12 @@ export interface BotApi {
     html: string,
     keyboard?: InlineKeyboard,
   ): Promise<number>;
-  /** Edit a message in place with new Rich Message content. */
-  editRich(messageId: number, html: string): Promise<void>;
+  /**
+   * Edit a message in place with new Rich Message content. An optional keyboard
+   * is passed as `reply_markup` — NOTE Telegram DROPS an existing keyboard when
+   * `reply_markup` is omitted on an edit, so a panel refresh must ALWAYS pass it.
+   */
+  editRich(messageId: number, html: string, keyboard?: InlineKeyboard): Promise<void>;
   /** Emit a chat action (typing heartbeat) for a topic. */
   sendChatAction(threadId: number | undefined, action: string): Promise<void>;
   /** Upload a local file as a document into a topic. */
@@ -139,6 +160,7 @@ export const COMMAND_LIST: Array<{ command: string; description: string }> = [
   { command: "new", description: "Start a session topic: /new [folder] [name…]" },
   { command: "sessions", description: "List resumable sessions to attach" },
   { command: "usage", description: "Update the 📊 Claude Usage stats topic" },
+  { command: "projects", description: "Update the 📁 Projects overview topic" },
   { command: "end", description: "End this session and close the topic" },
   { command: "cancel", description: "Cancel the in-flight turn" },
   { command: "mode", description: "Choose the agent mode" },
@@ -265,6 +287,24 @@ export class Bridge {
   #usageTimer: ReturnType<typeof setInterval> | undefined;
   readonly #collectUsage: () => Promise<UsageStats>;
 
+  // The 📁 Projects topic + its single edited overview message, persisted at
+  // {dataDir}/projects-topic.json so the topic is reused across restarts.
+  #projectsTopic: { threadId: number; messageId?: number } | undefined;
+  #projectsTimer: ReturnType<typeof setInterval> | undefined;
+  // Backlink targets from the LAST panel render, keyed by a monotonic counter
+  // referenced by proj:new:{k} / proj:att:{k} callback_data (paths never go in
+  // callback_data — 64-byte cap). Cleared + repopulated on every render; a tap
+  // whose key is gone answers "no longer listed" (exactly like #attachTargets).
+  #projSeq = 0;
+  readonly #projTargets = new Map<
+    number,
+    { kind: "new"; cwd: string } | { kind: "att"; sessionId: string; cwd: string; title: string }
+  >();
+  // Last successful resumable listing, kept warm so a timer/event refresh can
+  // render a 💤 section WITHOUT spawning a throwaway adapter (that cost is only
+  // acceptable for the manual /projects command).
+  #cachedSessions: acp.SessionInfo[] = [];
+
   // CLI-mirror: tail each stored session's JSONL and relay turns produced
   // OUTSIDE the bridge (e.g. `claude /resume` on the machine) into its topic.
   #mirrorTimer: ReturnType<typeof setInterval> | undefined;
@@ -328,6 +368,12 @@ export class Bridge {
     // so the timer alone never keeps the process alive.
     this.#usageTimer = setInterval(() => void this.#refreshUsagePanel(), USAGE_REFRESH_MS);
     this.#usageTimer.unref?.();
+
+    // Hourly 📁 Projects panel refresh, same edit-only semantics as usage: keeps
+    // an existing topic current but never creates one and never spawns a
+    // throwaway adapter (a live agent or the cached listing supplies 💤).
+    this.#projectsTimer = setInterval(() => void this.#refreshProjectsPanel(), USAGE_REFRESH_MS);
+    this.#projectsTimer.unref?.();
 
     // CLI-mirror poll: relay turns appended to a stored session's JSONL from
     // outside the bridge (claude /resume on the machine) into its topic.
@@ -401,6 +447,7 @@ export class Bridge {
         .catch((e) => logError("pinChatMessage failed", e));
     }
     await reply(`🆕 Created <b>${escapeHtml(title)}</b>.`);
+    this.#pokeProjects(); // a new running session changed the overview
   }
 
   /**
@@ -488,6 +535,12 @@ export class Bridge {
       return;
     }
 
+    // `/projects` works from any topic (it updates the 📁 Projects topic).
+    if (cmd?.cmd === "projects") {
+      await this.#handleProjects(threadId);
+      return;
+    }
+
     const session = this.#sessions.get(threadId);
     if (!session) {
       // A stored-but-disconnected topic (e.g. after a bridge restart) still has
@@ -531,6 +584,7 @@ export class Bridge {
     if (data.startsWith("continue:")) return this.#handleContinueCallback(data, callbackMessageId);
     if (data.startsWith("restart:")) return this.#handleRestartCallback(data);
     if (data.startsWith("attach:")) return this.#handleAttachCallback(data);
+    if (data.startsWith("proj:")) return this.#handleProjectsCallback(data);
     return undefined;
   }
 
@@ -539,6 +593,10 @@ export class Bridge {
     if (this.#usageTimer !== undefined) {
       clearInterval(this.#usageTimer);
       this.#usageTimer = undefined;
+    }
+    if (this.#projectsTimer !== undefined) {
+      clearInterval(this.#projectsTimer);
+      this.#projectsTimer = undefined;
     }
     if (this.#mirrorTimer !== undefined) {
       clearInterval(this.#mirrorTimer);
@@ -639,6 +697,7 @@ export class Bridge {
       force: true,
     }).catch((e) => logError("uploads cleanup failed", e));
     await this.#botApi.closeForumTopic(threadId).catch((e) => logError("closeForumTopic", e));
+    this.#pokeProjects(); // the session left the overview
   }
 
   async #yolo(threadId: number, agent: AgentSession): Promise<void> {
@@ -886,6 +945,7 @@ export class Bridge {
             ],
           ],
         });
+        this.#pokeProjects(); // session moved disconnected → running
         return { toast: "reconnected" };
       }
       // loadSession failed; AgentSession fell back to a fresh session.
@@ -894,6 +954,7 @@ export class Bridge {
         threadId,
         `⚠️ <b>${escapeHtml(stored.title)}</b> — previous session could not be restored; started fresh.`,
       );
+      this.#pokeProjects(); // session moved disconnected → running
       return { toast: "started fresh" };
     } catch (e) {
       logError(`reconnect failed for thread ${threadId}`, e);
@@ -1030,6 +1091,7 @@ export class Bridge {
     let sessions: acp.SessionInfo[];
     try {
       sessions = await this.#fetchSessions();
+      this.#cachedSessions = sessions; // keep the Projects panel's 💤 cache warm
     } catch (e) {
       logError("listSessions failed", e);
       await this.#send(replyThreadId, "⚠️ could not list sessions — see logs.");
@@ -1182,6 +1244,7 @@ export class Bridge {
       createdAt: new Date().toISOString(),
     });
     await this.#send(threadId, "📎 attached — full history above; the session is live");
+    this.#pokeProjects(); // session moved resumable → running
     return { toast: "attached" };
   }
 
@@ -1403,6 +1466,266 @@ export class Bridge {
     await this.#saveUsageTopic();
   }
 
+  // --- /projects -----------------------------------------------------------
+
+  get #projectsTopicFile(): string {
+    return path.join(this.#cfg.dataDir, "projects-topic.json");
+  }
+
+  async #loadProjectsTopic(): Promise<void> {
+    if (this.#projectsTopic) return;
+    try {
+      const raw = JSON.parse(await readFile(this.#projectsTopicFile, "utf-8")) as unknown;
+      if (
+        typeof raw === "object" &&
+        raw !== null &&
+        typeof (raw as { threadId?: unknown }).threadId === "number"
+      ) {
+        this.#projectsTopic = raw as { threadId: number; messageId?: number };
+      }
+    } catch {
+      // missing/corrupt file → a fresh topic is created on demand
+    }
+  }
+
+  async #saveProjectsTopic(): Promise<void> {
+    await writeFile(this.#projectsTopicFile, JSON.stringify(this.#projectsTopic ?? null)).catch(
+      (e) => logError("projects-topic save failed", e),
+    );
+  }
+
+  /**
+   * `/projects`: (re)build the 📁 Projects overview into its dedicated topic —
+   * ONE message, edited in place with its backlink keyboard (created + pinned on
+   * first use; recreated if the topic was deleted). A short confirmation goes to
+   * wherever the command was issued (unless that IS the projects topic).
+   */
+  async #handleProjects(replyThreadId: number | undefined): Promise<void> {
+    try {
+      await this.#updateProjectsPanel(true);
+    } catch (e) {
+      logError("projects update failed", e);
+      await this.#send(replyThreadId, "⚠️ could not update the projects overview — see logs.");
+      return;
+    }
+    if (replyThreadId !== this.#projectsTopic?.threadId) {
+      await this.#send(replyThreadId, "📁 projects updated.");
+    }
+  }
+
+  /** The hourly/event refresh tick: edit-only (never resurrects a deleted topic). */
+  async #refreshProjectsPanel(): Promise<void> {
+    try {
+      await this.#loadProjectsTopic();
+      if (!this.#projectsTopic) return; // never ran /projects → nothing to refresh
+      await this.#updateProjectsPanel(false);
+    } catch (e) {
+      logError("scheduled projects refresh failed", e);
+    }
+  }
+
+  /**
+   * Fire-and-forget edit-only Projects refresh after a state change. Wrapped so
+   * no caller path (newTopic, /end, attach, reconnect, prune) can be failed by
+   * the panel; the refresh is itself edit-only and never spawns a throwaway.
+   */
+  #pokeProjects(): void {
+    void this.#refreshProjectsPanel().catch((e) => logError("projects poke failed", e));
+  }
+
+  /** Collect + render + deliver the overview panel. Throws on hard failure. */
+  async #updateProjectsPanel(recreate: boolean): Promise<void> {
+    const resumable = await this.#listResumable(recreate);
+    const projects = this.#buildProjects(resumable);
+    await this.#loadProjectsTopic();
+    const html = renderProjectsRich(projects);
+    const keyboard = buildProjectsKeyboard(projects, this.#cfg.forumChatId);
+    await this.#deliverProjects(html, keyboard, recreate);
+  }
+
+  /**
+   * Resumable listing for the panel. Reuses an existing live agent when one
+   * exists (a real `session/list`, no subprocess); otherwise spawns a throwaway
+   * ONLY when `allowSpawn` (the manual /projects command). A timer/event refresh
+   * passes `allowSpawn=false` and falls back to the cached last listing — it
+   * must NEVER spawn from a timer.
+   */
+  async #listResumable(allowSpawn: boolean): Promise<acp.SessionInfo[]> {
+    if (this.#sessions.size > 0 || allowSpawn) {
+      try {
+        const sessions = await this.#fetchSessions();
+        this.#cachedSessions = sessions;
+        return sessions;
+      } catch (e) {
+        logError("projects resumable listing failed", e);
+      }
+    }
+    return this.#cachedSessions;
+  }
+
+  /**
+   * Shape the projects + their grouped sessions for the panel, and (re)populate
+   * the backlink target map. Projects = union of cfg.projects paths (listed even
+   * with zero sessions), stored-session cwds, and free resumable-session cwds.
+   * Order: cfg projects first (object order), then the rest alphabetically by
+   * display name; within a project running → disconnected → resumable (newest
+   * first). Clears + repopulates #projTargets so stale taps miss.
+   */
+  #buildProjects(resumable: acp.SessionInfo[]): ProjectView[] {
+    this.#projTargets.clear();
+
+    const stored = this.#store.list();
+    const attachedIds = new Set(stored.map((s) => s.acpSessionId));
+    // Same filter as #handleSessions: exclude ids already attached / attaching.
+    const freeResumable = resumable.filter(
+      (s) => !attachedIds.has(s.sessionId) && !this.#attaching.has(s.sessionId),
+    );
+
+    // Reverse cfg.projects (name → path) into path → display name (first wins).
+    const pathToName = new Map<string, string>();
+    for (const [name, p] of Object.entries(this.#cfg.projects)) {
+      if (!pathToName.has(p)) pathToName.set(p, name);
+    }
+    const displayName = (cwd: string): string => pathToName.get(cwd) ?? shortenHome(cwd);
+
+    const cfgPaths = [...new Set(Object.values(this.#cfg.projects))];
+    const cfgSet = new Set(cfgPaths);
+    const rest = new Set<string>();
+    for (const s of stored) if (!cfgSet.has(s.cwd)) rest.add(s.cwd);
+    for (const s of freeResumable) if (!cfgSet.has(s.cwd)) rest.add(s.cwd);
+    const orderedCwds = [
+      ...cfgPaths,
+      ...[...rest].sort((a, b) => displayName(a).localeCompare(displayName(b))),
+    ];
+
+    const views: ProjectView[] = [];
+    for (const cwd of orderedCwds) {
+      const running: ProjectSession[] = [];
+      const disconnected: ProjectSession[] = [];
+      for (const s of stored) {
+        if (s.cwd !== cwd) continue;
+        const line: ProjectSession = { title: s.title, threadId: s.threadId };
+        if (this.#sessions.has(s.threadId)) running.push(line);
+        else disconnected.push(line);
+      }
+      const resumableLines: ProjectSession[] = freeResumable
+        .filter((s) => s.cwd === cwd)
+        .sort(
+          (a, b) =>
+            (b.updatedAt ? Date.parse(b.updatedAt) : 0) -
+            (a.updatedAt ? Date.parse(a.updatedAt) : 0),
+        )
+        .map((s) => {
+          const k = ++this.#projSeq;
+          const title = (s.title ?? "").trim() || randomName();
+          this.#projTargets.set(k, { kind: "att", sessionId: s.sessionId, cwd, title });
+          const date = s.updatedAt
+            ? new Date(s.updatedAt).toISOString().slice(0, 16).replace("T", " ")
+            : undefined;
+          return { title, attachKey: k, ...(date ? { date } : {}) };
+        });
+
+      const newKey = ++this.#projSeq;
+      this.#projTargets.set(newKey, { kind: "new", cwd });
+      views.push({
+        name: displayName(cwd),
+        cwd,
+        newKey,
+        running,
+        disconnected,
+        resumable: resumableLines,
+      });
+    }
+    return views;
+  }
+
+  /**
+   * Edit the overview message in place (ALWAYS with its keyboard — Telegram drops
+   * an omitted reply_markup on edit). With `recreate` the topic/message are
+   * (re)created as needed (`/projects`); without it a deleted topic just clears
+   * the pointer. Mirrors {@link Bridge.#deliverUsage}.
+   */
+  async #deliverProjects(html: string, keyboard: InlineKeyboard, recreate: boolean): Promise<void> {
+    if (this.#projectsTopic?.messageId !== undefined) {
+      try {
+        await this.#botApi.editRich(this.#projectsTopic.messageId, html, keyboard);
+        return;
+      } catch (e) {
+        if (e instanceof Error && /not modified/i.test(e.message)) return; // same content
+        if (isThreadNotFound(e)) {
+          this.#projectsTopic = undefined; // topic deleted
+        } else {
+          // message deleted or too old to edit → send a fresh one below
+          this.#projectsTopic = { threadId: this.#projectsTopic.threadId };
+        }
+      }
+    }
+    if (!this.#projectsTopic) {
+      if (!recreate) {
+        await this.#saveProjectsTopic(); // persist the cleared pointer
+        return;
+      }
+      const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
+      this.#projectsTopic = { threadId };
+    }
+    try {
+      const messageId = await this.#botApi.sendRich(this.#projectsTopic.threadId, html, keyboard);
+      this.#projectsTopic.messageId = messageId;
+      await this.#botApi
+        .pinChatMessage(this.#projectsTopic.threadId, messageId)
+        .catch((e) => logError("projects pin failed", e));
+    } catch (e) {
+      if (!isThreadNotFound(e)) throw e;
+      if (!recreate) {
+        this.#projectsTopic = undefined;
+        await this.#saveProjectsTopic();
+        return;
+      }
+      const threadId = await this.#botApi.createForumTopic("📁 Projects", ICON_COLORS[0]!);
+      this.#projectsTopic = { threadId };
+      const messageId = await this.#botApi.sendRich(threadId, html, keyboard);
+      this.#projectsTopic.messageId = messageId;
+      await this.#botApi
+        .pinChatMessage(threadId, messageId)
+        .catch((e2) => logError("projects pin failed", e2));
+    }
+    await this.#saveProjectsTopic();
+  }
+
+  /**
+   * Route a `proj:` backlink tap. `proj:new:{k}` opens a fresh session in the
+   * mapped cwd (reusing newTopic, which pokes the panel on success);
+   * `proj:att:{k}` attaches the mapped resumable session (reusing #attachTarget,
+   * guarded by #attaching exactly like #handleAttachCallback). A key missing from
+   * the (per-render) target map answers a "no longer listed" toast.
+   */
+  async #handleProjectsCallback(data: string): Promise<{ toast: string }> {
+    if (data.startsWith("proj:new:")) {
+      const t = this.#projTargets.get(Number(data.slice("proj:new:".length)));
+      if (!t || t.kind !== "new") return { toast: "no longer listed" };
+      // A no-op reply keeps newTopic's confirmation off Telegram; the toast
+      // carries the outcome. newTopic resolves the absolute cwd via its /~ branch.
+      let created = false;
+      await this.newTopic(t.cwd, async (h) => {
+        created = /Created/.test(h);
+      });
+      return { toast: created ? "session created" : "could not create session" };
+    }
+    if (data.startsWith("proj:att:")) {
+      const k = Number(data.slice("proj:att:".length));
+      const t = this.#projTargets.get(k);
+      if (!t || t.kind !== "att") return { toast: "no longer listed" };
+      this.#projTargets.delete(k); // evict on use
+      this.#attaching.add(t.sessionId);
+      try {
+        return await this.#attachTarget({ sessionId: t.sessionId, cwd: t.cwd, title: t.title });
+      } finally {
+        this.#attaching.delete(t.sessionId);
+      }
+    }
+    return { toast: "" };
+  }
+
   // --- helpers -------------------------------------------------------------
 
   async #handleGeneral(msg: IncomingMsg): Promise<void> {
@@ -1417,6 +1740,10 @@ export class Bridge {
     }
     if (cmd?.cmd === "usage") {
       await this.#handleUsage(undefined);
+      return;
+    }
+    if (cmd?.cmd === "projects") {
+      await this.#handleProjects(undefined);
       return;
     }
     await this.#send(
@@ -1555,6 +1882,7 @@ export class Bridge {
     }
     await this.#store.remove(threadId);
     log.info({ threadId }, "[bridge] topic deleted in Telegram; session released for re-attach");
+    this.#pokeProjects(); // the session left the overview
   }
 }
 

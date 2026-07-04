@@ -77,12 +77,15 @@ function makeBotApi(bot: Bot, cfg: Config): BotApi {
       );
       return m.message_id;
     },
-    async editRich(messageId, html): Promise<void> {
+    async editRich(messageId, html, keyboard?: InlineKeyboard): Promise<void> {
       await tgCall(() =>
         bot.api.raw.editMessageText({
           chat_id: chatId,
           message_id: messageId,
           rich_message: { html },
+          // Telegram drops an existing keyboard when reply_markup is omitted on
+          // an edit, so panel refreshes always pass it back.
+          reply_markup: keyboard,
         }),
       );
     },
