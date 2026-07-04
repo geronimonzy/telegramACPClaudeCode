@@ -559,6 +559,63 @@ describe("Bridge", () => {
       expect(store.get(t1)?.mirrorOffset).toBeUndefined();
       expect(botApi.htmlFor(t1).join("\n")).not.toContain("💻");
     });
+
+    it("renders mirrored tool activity as an Activity-styled panel interleaved with prose", async () => {
+      const cliToolUse = (id: string, name: string, input: unknown = {}): string =>
+        JSON.stringify({
+          type: "assistant",
+          entrypoint: "cli",
+          message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] },
+        }) + "\n";
+      const cliToolResult = (id: string, isError = false): string =>
+        JSON.stringify({
+          type: "user",
+          entrypoint: "cli",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: id, is_error: isError }],
+          },
+        }) + "\n";
+
+      const { bridge, botApi } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      const projDir = join(dir, dir.replace(/[^a-zA-Z0-9]/g, "-"));
+      await mkdir(projDir, { recursive: true });
+      const fp = join(projDir, "sess_mock_1.jsonl");
+      await writeFile(fp, cliUser("baseline"));
+      await bridge.mirrorNow(); // baselines the cursor
+
+      await appendFile(
+        fp,
+        cliUser("do something") +
+          cliAgent("on it") +
+          cliToolUse("t1", "Read", { file_path: "/a.ts" }) +
+          cliToolResult("t1") +
+          cliAgent("all done"),
+      );
+      await bridge.mirrorNow();
+
+      // One message per turn: "do something" (user) → "on it" (agent) → the
+      // tool burst as its own Activity panel → "all done" (agent) — the
+      // panel lands strictly BETWEEN the two prose messages it belongs
+      // between, mirroring how a live turn interleaves prose and Activity.
+      const msgs = botApi.htmlFor(t1);
+      const userIdx = msgs.findIndex((h) => h.includes("do something"));
+      const onItIdx = msgs.findIndex((h) => h.includes("on it"));
+      const activityIdx = msgs.findIndex((h) => h.includes("⚙️ Activity"));
+      const doneIdx = msgs.findIndex((h) => h.includes("all done"));
+      expect(userIdx).toBeGreaterThanOrEqual(0);
+      expect(onItIdx).toBeGreaterThan(userIdx);
+      expect(activityIdx).toBeGreaterThan(onItIdx);
+      expect(doneIdx).toBeGreaterThan(activityIdx);
+
+      const panel = msgs[activityIdx]!;
+      expect(panel).toContain("Read: /a.ts");
+      expect(panel).toContain("✅"); // ok status mark, matching activity.ts's completed glyph
+      expect(panel).not.toContain("❌");
+    });
   });
 
   describe("adapter env", () => {
