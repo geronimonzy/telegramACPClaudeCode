@@ -175,6 +175,17 @@ function logError(context: string, e: unknown): void {
   log.error({ err: e }, `[bridge] ${context}`);
 }
 
+/**
+ * True when a Telegram error means the target forum topic no longer exists
+ * (user deleted it in the Telegram UI — bots receive NO update for that, so
+ * it can only be noticed when a call into the thread fails). A closed topic
+ * (`TOPIC_CLOSED`) is deliberately NOT matched: it still exists.
+ */
+function isThreadNotFound(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /thread not found|TOPIC_DELETED/i.test(msg);
+}
+
 /** Truncate to `max` chars, appending an ellipsis when cut. */
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
@@ -885,6 +896,18 @@ export class Bridge {
    * inline `attach:{k}` button per remaining session (most recent ~10).
    */
   async #handleSessions(replyThreadId: number | undefined): Promise<void> {
+    // Reconcile first: a topic deleted in the Telegram UI leaves a stale
+    // store entry that would permanently hide its session from this listing
+    // (deletion produces no bot update). Probe each stored topic with a chat
+    // action — the cheapest thread-scoped call — and prune the dead ones.
+    for (const s of this.#store.list()) {
+      try {
+        await this.#botApi.sendChatAction(s.threadId, "typing");
+      } catch (e) {
+        if (isThreadNotFound(e)) await this.#pruneDeletedTopic(s.threadId);
+      }
+    }
+
     let sessions: acp.SessionInfo[];
     try {
       sessions = await this.#fetchSessions();
@@ -1152,8 +1175,38 @@ export class Bridge {
     try {
       await this.#botApi.sendMessage(threadId, html, keyboard);
     } catch (e) {
+      // A send into a topic the user deleted in Telegram is the ONLY signal
+      // deletion ever produces (no bot update exists) — reconcile on it.
+      if (threadId !== undefined && isThreadNotFound(e)) {
+        await this.#pruneDeletedTopic(threadId);
+        return;
+      }
       logError("send failed", e);
     }
+  }
+
+  /**
+   * A topic was deleted in the Telegram UI: tear down its live session (if
+   * any) and drop its store entry, so the ACP session stops being filtered
+   * out of `/sessions` and can be attached into a fresh topic.
+   */
+  async #pruneDeletedTopic(threadId: number): Promise<void> {
+    const session = this.#sessions.get(threadId);
+    if (session) {
+      this.#sessions.delete(threadId);
+      this.#terminals.releaseForSession(session.agentSession.sessionId);
+      try {
+        await session.dispose();
+        await session.agentSession.dispose();
+      } catch (e) {
+        logError("prune dispose failed", e);
+      }
+    } else {
+      const stored = this.#store.get(threadId);
+      if (stored) this.#terminals.releaseForSession(stored.acpSessionId);
+    }
+    await this.#store.remove(threadId);
+    log.info({ threadId }, "[bridge] topic deleted in Telegram; session released for re-attach");
   }
 }
 

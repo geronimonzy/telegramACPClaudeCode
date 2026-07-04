@@ -6,13 +6,14 @@
 // agnostic {@link BotApi} the Bridge depends on, and (4) normalizes inbound
 // updates and hands them to the Bridge. All behaviour lives in bridge.ts.
 
-import { Bot, InputFile, type Context } from "grammy";
+import { Bot, GrammyError, InputFile, type Context } from "grammy";
 import { run, type RunnerHandle } from "@grammyjs/runner";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { Message } from "@grammyjs/types";
 import type { Config } from "../config.js";
 import { log } from "../log.js";
 import { StateStore } from "../state.js";
+import { TgApiError } from "./live-message.js";
 import { Bridge, type BotApi, type IncomingMsg, type InlineKeyboard } from "../bridge.js";
 
 /** Hard-exit grace period: if graceful shutdown hasn't finished by then, force exit. */
@@ -20,6 +21,21 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /** The exact literal union grammY types `icon_color` as; our palette is a subset. */
 type IconColor = 0x6fb9f0 | 0xffd67e | 0xcb86db | 0x8eee98 | 0xff93b2 | 0xfb6f5f;
+
+/**
+ * Re-throw a grammY API error as the transport-agnostic {@link TgApiError} the
+ * Throttle/Bridge layers inspect (parse-error 400 fallback, deleted-topic
+ * detection). Without this translation every GrammyError fails their
+ * `instanceof TgApiError` checks and the structured handling never fires.
+ */
+async function tgCall<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof GrammyError) throw new TgApiError(e.error_code, e.description);
+    throw e;
+  }
+}
 
 /** Build the {@link BotApi} adapter over a grammY Bot bound to the forum chat. */
 function makeBotApi(bot: Bot, cfg: Config): BotApi {
@@ -36,38 +52,46 @@ function makeBotApi(bot: Bot, cfg: Config): BotApi {
       return topic.message_thread_id;
     },
     async sendMessage(threadId, html, keyboard?: InlineKeyboard): Promise<number> {
-      const m = await bot.api.sendMessage(chatId, html, {
-        ...HTML,
-        message_thread_id: threadId,
-        reply_markup: keyboard,
-      });
+      const m = await tgCall(() =>
+        bot.api.sendMessage(chatId, html, {
+          ...HTML,
+          message_thread_id: threadId,
+          reply_markup: keyboard,
+        }),
+      );
       return m.message_id;
     },
     async editMessageText(messageId, html): Promise<void> {
-      await bot.api.editMessageText(chatId, messageId, html, HTML);
+      await tgCall(() => bot.api.editMessageText(chatId, messageId, html, HTML));
     },
     async sendRich(threadId, html, keyboard?: InlineKeyboard): Promise<number> {
       // Low-level object form to sidestep grammY's positional-wrapper trap for
       // sendRichMessage (see scripts/spike-rich.ts / rich-messages.md).
-      const m = await bot.api.raw.sendRichMessage({
-        chat_id: chatId,
-        message_thread_id: threadId,
-        rich_message: { html },
-        reply_markup: keyboard,
-      });
+      const m = await tgCall(() =>
+        bot.api.raw.sendRichMessage({
+          chat_id: chatId,
+          message_thread_id: threadId,
+          rich_message: { html },
+          reply_markup: keyboard,
+        }),
+      );
       return m.message_id;
     },
     async editRich(messageId, html): Promise<void> {
-      await bot.api.raw.editMessageText({
-        chat_id: chatId,
-        message_id: messageId,
-        rich_message: { html },
-      });
+      await tgCall(() =>
+        bot.api.raw.editMessageText({
+          chat_id: chatId,
+          message_id: messageId,
+          rich_message: { html },
+        }),
+      );
     },
     async sendChatAction(threadId, action): Promise<void> {
-      await bot.api.sendChatAction(chatId, action as "typing", {
-        message_thread_id: threadId,
-      });
+      await tgCall(() =>
+        bot.api.sendChatAction(chatId, action as "typing", {
+          message_thread_id: threadId,
+        }),
+      );
     },
     async sendDocument(threadId, filePath, caption?: string): Promise<void> {
       await bot.api.sendDocument(chatId, new InputFile(filePath), {

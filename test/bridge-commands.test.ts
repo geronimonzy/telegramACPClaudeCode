@@ -731,6 +731,47 @@ describe("Bridge", () => {
       expect(entry?.title).toBe("Resume me please");
     });
 
+    it("a topic deleted in Telegram is pruned by /sessions and its session re-listed", async () => {
+      const { bridge, botApi, store, mocks } = makeBridge((a) => {
+        a.listSessionsResponse = SESSIONS;
+      });
+      // A live topic bound to sess_mock_1 (normally filtered from the listing).
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+      expect(store.get(t1)?.acpSessionId).toBe("sess_mock_1");
+
+      // The user deletes the topic in the Telegram UI (no bot update exists).
+      botApi.deadThreads.add(t1);
+
+      await bridge.handleMessage(undefined, { text: "/sessions" });
+
+      // Probe noticed the dead thread: store entry pruned.
+      expect(store.get(t1)).toBeUndefined();
+      // The freed session is offered again in the listing.
+      const listing = botApi.messages.filter((m) => m.keyboard && /Resumable sessions/.test(m.html)).at(-1)!;
+      expect(listing.html).toContain("Resume me please");
+      // And a prompt into the dead topic no longer routes anywhere.
+      await bridge.handleMessage(t1, { text: "hello?" });
+      expect(mocks[0]!.received).toHaveLength(0);
+    });
+
+    it("a failing send into a deleted stored topic prunes it (restart-notice path)", async () => {
+      const { bridge, botApi, store } = makeBridge();
+      const stored: SessionState = {
+        threadId: 999,
+        acpSessionId: "gone-topic-session",
+        cwd: dir,
+        title: "deleted-one",
+        createdAt: new Date().toISOString(),
+      };
+      await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+      botApi.deadThreads.add(999);
+
+      await bridge.init(); // posts the disconnect notice → thread not found → prune
+
+      expect(store.get(999)).toBeUndefined();
+    });
+
     it("a stale/unknown attach:{k} toasts and does not crash or create a topic", async () => {
       const { bridge, botApi } = makeBridge();
       const res = await bridge.handleCallback("attach:9999", 1);

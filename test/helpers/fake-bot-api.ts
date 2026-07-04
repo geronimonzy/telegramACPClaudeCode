@@ -20,8 +20,17 @@ export class FakeBotApi implements BotApi {
   files = new Map<string, { filePath: string; fileSize: number }>();
   fileBytes = new Map<string, Buffer>();
 
+  /** Thread ids whose topic was "deleted": thread-scoped calls throw. */
+  deadThreads = new Set<number>();
+
   #nextThreadId = 100;
   #nextMessageId = 1;
+
+  #throwIfDead(threadId: number | undefined): void {
+    if (threadId !== undefined && this.deadThreads.has(threadId)) {
+      throw new Error("Bad Request: message thread not found");
+    }
+  }
 
   async createForumTopic(name: string, iconColor: number): Promise<number> {
     const threadId = this.#nextThreadId++;
@@ -34,6 +43,7 @@ export class FakeBotApi implements BotApi {
     html: string,
     keyboard?: InlineKeyboard,
   ): Promise<number> {
+    this.#throwIfDead(threadId);
     const messageId = this.#nextMessageId++;
     this.messages.push({ threadId, html, keyboard, messageId });
     return messageId;
@@ -50,6 +60,7 @@ export class FakeBotApi implements BotApi {
     html: string,
     keyboard?: InlineKeyboard,
   ): Promise<number> {
+    this.#throwIfDead(threadId);
     const messageId = this.#nextMessageId++;
     this.messages.push({ threadId, html, keyboard, messageId });
     return messageId;
@@ -60,6 +71,7 @@ export class FakeBotApi implements BotApi {
   }
 
   async sendChatAction(threadId: number | undefined, action: string): Promise<void> {
+    this.#throwIfDead(threadId);
     this.chatActions.push({ threadId, action });
   }
 
