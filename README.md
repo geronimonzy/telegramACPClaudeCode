@@ -158,22 +158,23 @@ touches an existing `config.json`.
 
 ## Command reference
 
-Commands run inside a session topic unless noted. `/new`, `/sessions` and
-`/usage` also work from General or any topic.
+Commands run inside a session topic unless noted. `/new`, `/sessions`,
+`/usage` and `/projects` also work from General or any topic.
 
 | Command | Description |
 |---|---|
 | `/new [folder] [name…]` | Start a new session topic. The first word picks the working directory: an absolute or `~` path (must exist), a key in `projects`, or a directory under `defaultCwd`. Everything after it becomes the topic title (e.g. `/new receiptSaas Design Requirements`); with no title the topic gets a random three-word name. With no arguments at all: `defaultCwd` + random name. |
-| *(automatic)* | **CLI mirroring**: if you pick a bridge session up on the machine (`claude` → `/resume`), messages you exchange there are relayed into its Telegram topic within ~15s, rendered like an attach transcript (`👤 You` quotes / 🤖 markdown) under a `💻 picked up outside Telegram` notice. The bridge's own traffic is never echoed back. |
+| *(automatic)* | **CLI mirroring**: if you pick a bridge session up on the machine (`claude` → `/resume`), messages you exchange there are relayed into its Telegram topic within ~15s, rendered like an attach transcript (`👤 You` quotes / 🤖 markdown, tool calls as static ⚙️ Activity panels interleaved in turn order) under a `💻 picked up outside Telegram` notice. The bridge's own traffic is never echoed back. |
 | `/usage` | Update the dedicated **📊 Claude Usage** topic: per-model token usage for today and the last 7 days (aggregated from the local `~/.claude` session files) plus each live session's context fill. The topic and its single pinned stats message are created on first use and edited in place afterwards. Works from any topic. |
-| `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic and replays the session's **full** history — one message per speaker turn (your messages as bold `👤 You` quotes, the agent's as rendered markdown under 🤖) — then goes live. Works from General or any topic. |
+| `/projects` | Update the dedicated **📁 Projects** topic: every project (`projects` config keys ∪ session working directories) with its sessions grouped 🟢 running / 🔌 disconnected / 💤 resumable, one pinned message edited in place (same lifecycle as `/usage`). The message's buttons are backlinks: **➕ project** starts a new session there, **🟢/🔌 session** deep-links to its topic, **💤 session** attaches it first. Refreshes hourly and after session changes; only the manual command may spawn a helper agent to list resumable sessions. Works from any topic. |
+| `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic and replays the session's **full** history — one message per speaker turn (your messages as bold `👤 You` quotes, the agent's as rendered markdown under 🤖, tool activity as ⚙️ panels) — then goes live. Works from General or any topic. |
 | `/end` | End this session and close the topic. |
 | `/cancel` | Cancel the in-flight turn. |
 | `/mode` | Choose the agent mode (inline keyboard of modes the agent advertises). |
 | `/model` | Choose the model for this session (inline keyboard of what the adapter advertises: default/sonnet/opus/haiku/…; current value ✅-marked). |
 | `/effort` | Choose the reasoning effort for this session (default/low/medium/high/xhigh/max; current value ✅-marked). |
 | `/yolo` | Toggle bypass-permissions mode on/off for this session. |
-| `/status` | Show session status: session id, cwd, mode, and token/cost usage if available. |
+| `/status` | Show session status: session id, cwd, mode, model + effort (when the agent advertises them), and token/cost usage if available. |
 | `/commands` | List the commands *this agent* (Claude Code) advertises beyond the bridge's own. |
 | `/cwd` | Show the session's working directory. |
 | `/file <path>` | Send a file from the session's cwd back into the topic (path must resolve inside the cwd; capped at 50 MB). |
@@ -186,8 +187,8 @@ send next in that topic (a photo/document with no accompanying text is held
 until you do).
 
 General topic behavior: messages sent outside any topic only accept `/new`,
-`/sessions` and `/usage`; anything else gets a short reminder to use `/new`
-or to talk inside a session topic.
+`/sessions`, `/usage` and `/projects`; anything else gets a short reminder to
+use `/new` or to talk inside a session topic.
 
 Housekeeping the bridge does on its own:
 
@@ -203,6 +204,9 @@ Housekeeping the bridge does on its own:
   existed remain hidden.
 - **The 📊 Claude Usage panel refreshes hourly** (edit-only — deleting the
   topic disables the refresh until the next manual `/usage`).
+- **The 📁 Projects panel refreshes hourly and after session changes**
+  (new/end/attach/reconnect/prune), also edit-only with the same
+  deleted-topic semantics as the usage panel.
 
 ## Troubleshooting
 
