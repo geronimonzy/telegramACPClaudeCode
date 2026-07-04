@@ -497,6 +497,30 @@ describe("Bridge", () => {
     expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
   });
 
+  describe("adapter env", () => {
+    it("spawns the adapter with CLAUDE_CODE_ENTRYPOINT so sessions show in /resume", async () => {
+      const spawnEnvs: Array<Record<string, string> | undefined> = [];
+      const cfg = makeConfig();
+      const botApi = new FakeBotApi();
+      const store = new StateStore(join(dir, "state.json"));
+      const starter: AgentStarter = async (opts) => {
+        spawnEnvs.push(opts.spawn?.env);
+        const { agent } = wireMockAgent();
+        void agent;
+        const { clientStream } = wireMockAgent();
+        return AgentSession.start({ ...opts, stream: clientStream, spawn: undefined });
+      };
+      const bridge = new Bridge(cfg, botApi, store, starter);
+      await bridge.newTopic(undefined, async () => {});
+      expect(spawnEnvs[0]?.CLAUDE_CODE_ENTRYPOINT).toBe("telegram-acp-bridge");
+
+      // A config-supplied value wins over the default.
+      cfg.adapterEnv = { CLAUDE_CODE_ENTRYPOINT: "custom" };
+      await bridge.newTopic(undefined, async () => {});
+      expect(spawnEnvs[1]?.CLAUDE_CODE_ENTRYPOINT).toBe("custom");
+    });
+  });
+
   describe("/model and /effort", () => {
     it("/model offers the advertised models (current ✅-marked); tapping sets it", async () => {
       const { bridge, botApi, mocks } = makeBridge();

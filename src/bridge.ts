@@ -113,6 +113,19 @@ const USAGE_REFRESH_MS = 60 * 60 * 1000;
 /** Display labels for the select config options the bridge exposes as commands. */
 const CONFIG_LABELS: Record<string, string> = { model: "Model", effort: "Effort" };
 
+/**
+ * Sessions record `entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT` in their
+ * JSONL, and the Claude Code CLI HIDES entrypoints `sdk-cli`/`sdk-ts`/`sdk-py`
+ * from the /resume picker — so bridge sessions (left to the SDK default,
+ * `sdk-ts`) were unresumable from the terminal. The binary keeps any other
+ * preset value verbatim (it only rewrites `cli` → `sdk-cli` when driven
+ * programmatically), so we identify honestly and stay visible. Overridable
+ * via cfg.adapterEnv.
+ */
+const ADAPTER_ENV_DEFAULTS: Record<string, string> = {
+  CLAUDE_CODE_ENTRYPOINT: "telegram-acp-bridge",
+};
+
 /** Expand a leading `~` / `~/` to the user's home directory. */
 function expandHome(p: string): string {
   if (p === "~" || p.startsWith("~/")) return path.join(homedir(), p.slice(1));
@@ -1037,7 +1050,7 @@ export class Bridge {
     }
     const agent = await this.#startAgent({
       cwd: this.#cfg.defaultCwd,
-      spawn: { command: this.#cfg.adapterCommand, env: this.#cfg.adapterEnv },
+      spawn: { command: this.#cfg.adapterCommand, env: { ...ADAPTER_ENV_DEFAULTS, ...this.#cfg.adapterEnv } },
       client: { ...makeFsHandlers(), ...this.#terminals.handlers() },
       onUpdate: () => {},
       onPermission: async () => ({ outcome: { outcome: "cancelled" } }),
@@ -1366,7 +1379,7 @@ export class Bridge {
       cwd,
       loadSessionId,
       ...(onReplayChunk ? { onReplayChunk } : {}),
-      spawn: { command: this.#cfg.adapterCommand, env: this.#cfg.adapterEnv },
+      spawn: { command: this.#cfg.adapterCommand, env: { ...ADAPTER_ENV_DEFAULTS, ...this.#cfg.adapterEnv } },
       client: { ...makeFsHandlers(), ...this.#terminals.handlers() },
       onUpdate: (u) => session?.handleUpdate(u),
       onPermission: (r) => session!.handlePermission(r),
