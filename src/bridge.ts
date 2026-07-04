@@ -17,7 +17,13 @@ import * as path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AgentSession, type AgentSessionOptions } from "./acp/agent-session.js";
 import { makeFsHandlers } from "./acp/fs-handlers.js";
-import { readNewTurns, readSessionTurns, sessionFilePath } from "./acp/session-file.js";
+import {
+  readNewTurns,
+  readSessionTurns,
+  sessionFilePath,
+  type ToolCallSummary,
+  type TranscriptTurn,
+} from "./acp/session-file.js";
 import {
   collectUsageStats,
   lastContextUsed,
@@ -40,6 +46,8 @@ import { StateStore, type SessionState } from "./state.js";
 import { TopicSession, type TopicUi } from "./orchestrator.js";
 import { MessageDraft } from "./telegram/draft.js";
 import {
+  escapeRich,
+  fitDetailsList,
   renderAgentTurnRich,
   renderUserTurnRich,
   RICH_MAX_LEN,
@@ -132,6 +140,8 @@ const MAX_TITLE_LEN = 64;
 const USAGE_REFRESH_MS = 60 * 60 * 1000;
 /** How often the CLI-mirror tails stored sessions' JSONLs. */
 const MIRROR_POLL_MS = 15 * 1000;
+/** Rows shown in one historical Activity panel before an "…and N more" row takes over. */
+const TOOLS_PANEL_MAX_ROWS = 30;
 
 /** Display labels for the select config options the bridge exposes as commands. */
 const CONFIG_LABELS: Record<string, string> = { model: "Model", effort: "Effort" };
@@ -1229,10 +1239,12 @@ export class Bridge {
     }
 
     // Prefer the transcript from Claude Code's own session file: it is local,
-    // authoritative, and immune to the adapter's truncated replay. The replay
-    // turns win only when the file is missing/unreadable or somehow holds
-    // LESS than the replay delivered (format drift safety net).
-    let transcript = turns;
+    // authoritative, and immune to the adapter's truncated replay — and the
+    // only source with tool-call bursts (the replay fallback below only ever
+    // carries prose chunks). The replay turns win only when the file is
+    // missing/unreadable or somehow holds LESS than the replay delivered
+    // (format drift safety net).
+    let transcript: TranscriptTurn[] = turns;
     try {
       const fileTurns = await readSessionTurns(
         this.#sessionFile(target.cwd, target.sessionId),
@@ -1317,15 +1329,18 @@ export class Bridge {
 
   /**
    * Post transcript turns ONE MESSAGE PER TURN — user turns as literal bold
-   * blockquotes, agent turns as markdown under a 🤖 header; MessageDraft owns
-   * rollover for any single turn past the rich budget. Shared by the attach
-   * replay and the CLI mirror.
+   * blockquotes, agent turns as markdown under a 🤖 header, tool bursts as a
+   * static ⚙️ Activity-style panel — interleaved in file order so historical
+   * transcripts read like a live turn. MessageDraft owns rollover for any
+   * single prose turn past the rich budget. Shared by the attach replay and
+   * the CLI mirror.
    */
-  async #postTranscript(
-    threadId: number,
-    turns: Array<{ role: "user" | "agent"; text: string }>,
-  ): Promise<void> {
+  async #postTranscript(threadId: number, turns: TranscriptTurn[]): Promise<void> {
     for (const turn of turns) {
+      if (turn.role === "tools") {
+        await this.#postToolsBurst(threadId, turn.calls);
+        continue;
+      }
       if (turn.text.trim() === "") continue;
       const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
         intervalMs: this.#cfg.editIntervalMs,
@@ -1335,6 +1350,30 @@ export class Bridge {
       draft.append(turn.text);
       await draft.finalize();
     }
+  }
+
+  /**
+   * Render one tool-call burst as a single static Rich Message, styled like
+   * activity.ts's live Activity panel (same `⚙️ Activity — N calls` summary,
+   * same ✅/❌ status marks) but one-shot: there is no live status to track,
+   * so every call renders as either ok (✅) or failed (❌) — never
+   * pending/in_progress, since by the time a historical transcript is read
+   * the turn is long over. Sent directly through the rich `send` path (no
+   * MessageDraft/rollover needed: rows are capped both in count and, via
+   * fitDetailsList, in total length). A burst with no calls (defensive —
+   * extractTurns never actually produces one) is skipped.
+   */
+  async #postToolsBurst(threadId: number, calls: ToolCallSummary[]): Promise<void> {
+    if (calls.length === 0) return;
+    const shown = calls.slice(0, TOOLS_PANEL_MAX_ROWS);
+    const rows = shown.map(
+      (c) => `<li>${c.failed ? "❌" : "✅"} <b>${escapeRich(c.title)}</b></li>`,
+    );
+    const omitted = calls.length - shown.length;
+    if (omitted > 0) rows.push(`<li><i>…and ${omitted} more</i></li>`);
+    const summary = `⚙️ Activity — ${calls.length} call${calls.length === 1 ? "" : "s"}`;
+    const html = fitDetailsList({ summary, rows, max: RICH_MAX_LEN, open: true });
+    await this.#makeUi(threadId).messageApi().send(html);
   }
 
   // --- /usage --------------------------------------------------------------

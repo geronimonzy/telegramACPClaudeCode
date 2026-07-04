@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readNewTurns, readSessionTurns, sessionFilePath } from "../src/acp/session-file.js";
@@ -75,13 +75,17 @@ function fixtureLines(): string[] {
 }
 
 describe("readSessionTurns", () => {
-  it("extracts prose turns in order, merging consecutive same-role texts", async () => {
+  it("extracts prose turns in order; a tool burst between them prevents the merge", async () => {
     const f = join(dir, "s.jsonl");
     await writeFile(f, fixtureLines().join("\n"));
     const turns = await readSessionTurns(f);
+    // "let me check" and "found it; here is the answer" no longer merge:
+    // the tool_use burst between them is real chronology, not noise.
     expect(turns).toEqual([
       { role: "user", text: "first question" },
-      { role: "agent", text: "let me check\n\nfound it; here is the answer" },
+      { role: "agent", text: "let me check" },
+      { role: "tools", calls: [{ title: "Read", failed: false }] },
+      { role: "agent", text: "found it; here is the answer" },
       { role: "user", text: "second question" },
       { role: "agent", text: "second answer" },
     ]);
@@ -110,6 +114,135 @@ describe("readSessionTurns", () => {
 
   it("throws when the file does not exist (caller falls back to replay)", async () => {
     await expect(readSessionTurns(join(dir, "missing.jsonl"))).rejects.toBeTruthy();
+  });
+});
+
+describe("readSessionTurns — tool-call bursts", () => {
+  const assistantToolUse = (
+    calls: Array<{ id: string; name: string; input?: unknown }>,
+    opts: { isSidechain?: boolean } = {},
+  ): string =>
+    L({
+      type: "assistant",
+      ...(opts.isSidechain !== undefined ? { isSidechain: opts.isSidechain } : {}),
+      message: {
+        role: "assistant",
+        content: calls.map((c) => ({ type: "tool_use", id: c.id, name: c.name, input: c.input ?? {} })),
+      },
+    });
+  const userToolResult = (
+    results: Array<{ tool_use_id: string; is_error?: boolean }>,
+    opts: { isMeta?: boolean } = {},
+  ): string =>
+    L({
+      type: "user",
+      ...(opts.isMeta !== undefined ? { isMeta: opts.isMeta } : {}),
+      message: {
+        role: "user",
+        content: results.map((r) => ({ type: "tool_result", tool_use_id: r.tool_use_id, is_error: r.is_error })),
+      },
+    });
+  const assistantText = (text: string): string =>
+    L({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+
+  it("folds consecutive tool_use blocks across multiple entries into ONE burst", async () => {
+    const f = join(dir, "s.jsonl");
+    await writeFile(
+      f,
+      [
+        assistantToolUse([{ id: "a", name: "Read", input: { file_path: "/x.ts" } }]),
+        userToolResult([{ tool_use_id: "a" }]), // ok, no is_error
+        assistantToolUse([{ id: "b", name: "Bash", input: { command: "ls -la /tmp" } }]),
+        userToolResult([{ tool_use_id: "b", is_error: true }]),
+        assistantText("done"),
+      ].join("\n"),
+    );
+    const turns = await readSessionTurns(f);
+    expect(turns).toEqual([
+      {
+        role: "tools",
+        calls: [
+          { title: "Read: /x.ts", failed: false },
+          { title: "Bash: ls -la /tmp", failed: true },
+        ],
+      },
+      { role: "agent", text: "done" },
+    ]);
+  });
+
+  it("derives titles from the first present input hint, collapsing whitespace and truncating", async () => {
+    const f = join(dir, "s.jsonl");
+    const longCmd = "x".repeat(80);
+    await writeFile(
+      f,
+      [
+        assistantToolUse([
+          { id: "1", name: "Read", input: { file_path: "/a.ts", path: "/should-not-win" } },
+          { id: "2", name: "Grep", input: { pattern: "foo" } },
+          { id: "3", name: "Task", input: { description: "explore  the\ncodebase" } },
+          { id: "4", name: "WebFetch", input: { url: "https://example.com" } },
+          { id: "5", name: "Glob", input: {} }, // no hint → name only
+          { id: "6", name: "Bash", input: { command: longCmd } },
+        ]),
+      ].join("\n"),
+    );
+    const turns = await readSessionTurns(f);
+    expect(turns).toEqual([
+      {
+        role: "tools",
+        calls: [
+          { title: "Read: /a.ts", failed: false },
+          { title: "Grep: foo", failed: false },
+          { title: "Task: explore the codebase", failed: false },
+          { title: "WebFetch: https://example.com", failed: false },
+          { title: "Glob", failed: false },
+          { title: `Bash: ${longCmd.slice(0, 60)}…`, failed: false },
+        ],
+      },
+    ]);
+  });
+
+  it("marks a call failed only when its tool_result carries is_error; unmatched ids are ignored", async () => {
+    const f = join(dir, "s.jsonl");
+    await writeFile(
+      f,
+      [
+        assistantToolUse([
+          { id: "ok", name: "Read", input: { file_path: "/a" } },
+          { id: "bad", name: "Read", input: { file_path: "/b" } },
+        ]),
+        userToolResult([
+          { tool_use_id: "bad", is_error: true },
+          { tool_use_id: "unknown-id", is_error: true }, // no matching tool_use — silently ignored
+        ]),
+      ].join("\n"),
+    );
+    const turns = await readSessionTurns(f);
+    expect(turns).toEqual([
+      {
+        role: "tools",
+        calls: [
+          { title: "Read: /a", failed: false },
+          { title: "Read: /b", failed: true },
+        ],
+      },
+    ]);
+  });
+
+  it("skips tool activity from sidechain/meta entries", async () => {
+    const f = join(dir, "s.jsonl");
+    await writeFile(
+      f,
+      [
+        assistantToolUse([{ id: "s1", name: "Read", input: { file_path: "/hidden" } }], {
+          isSidechain: true,
+        }),
+        userToolResult([{ tool_use_id: "s1", is_error: true }], { isMeta: true }),
+        assistantText("visible answer"),
+      ].join("\n"),
+    );
+    const turns = await readSessionTurns(f);
+    expect(turns).toEqual([{ role: "agent", text: "visible answer" }]);
   });
 });
 
@@ -175,6 +308,39 @@ describe("readNewTurns", () => {
     await writeFile(f, content);
     const size = Buffer.byteLength(content);
     expect(await readNewTurns(f, size)).toEqual({ turns: [], nextOffset: size });
+  });
+
+  it("a tool burst spanning polls: each poll parses independently, a result landing in a LATER poll than its call cannot retroactively flip it", async () => {
+    const f = join(dir, "s.jsonl");
+    const toolUseLine = (id: string, name: string): string =>
+      L({
+        type: "assistant",
+        entrypoint: "cli",
+        message: { role: "assistant", content: [{ type: "tool_use", id, name, input: {} }] },
+      });
+    const toolResultLine = (id: string, isError: boolean): string =>
+      L({
+        type: "user",
+        entrypoint: "cli",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: isError }] },
+      });
+
+    // Poll 1 catches the tool_use for "a" mid-burst — no result yet in this
+    // file slice — so it renders as an unresolved (ok) call, per design.
+    await writeFile(f, toolUseLine("a", "Read") + "\n");
+    const r1 = await readNewTurns(f, 0);
+    expect(r1.turns).toEqual([{ role: "tools", calls: [{ title: "Read", failed: false }] }]);
+
+    // Poll 2: the writer appends "a"'s result plus a fresh call "b" and its
+    // result. "a"'s result is orphaned across the poll boundary (its call
+    // isn't in THIS parse's id map) and is silently ignored — "a" was already
+    // reported ok in poll 1 and stays that way forever.
+    await appendFile(
+      f,
+      [toolResultLine("a", true), toolUseLine("b", "Bash"), toolResultLine("b", true)].join("\n") + "\n",
+    );
+    const r2 = await readNewTurns(f, r1.nextOffset);
+    expect(r2.turns).toEqual([{ role: "tools", calls: [{ title: "Bash", failed: true }] }]);
   });
 });
 
