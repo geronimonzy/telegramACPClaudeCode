@@ -130,16 +130,65 @@ describe("TopicSession", () => {
     expect(ui.typingCount).toBeGreaterThanOrEqual(1);
     expect(mock.received).toHaveLength(1);
 
-    // apis[0] = draft, apis[1] = activity, apis[2] = plan (creation order).
-    expect(latest(ui.apis[0]!)).toContain("Hello world");
+    // Creation order mirrors conversation order: text segment 1, then the
+    // activity panel, then the plan, then the post-tools text segment.
+    expect(latest(ui.apis[0]!)).toContain("Hello");
     expect(allContent(ui.apis[1]!)).toContain("Read file");
     expect(allContent(ui.apis[1]!)).toContain("Activity");
     expect(allContent(ui.apis[2]!)).toContain("Step one");
     expect(allContent(ui.apis[2]!)).toContain("Plan");
+    expect(latest(ui.apis[3]!)).toContain("world");
 
     // Permission resolved as "allow" (option 0) and echoed back to the agent.
     expect(mock.permissionOutcomes[0]?.outcome).toEqual({ outcome: "selected", optionId: "allow" });
     expect(ui.editedPermissions).toHaveLength(1);
+  });
+
+  it("interleaves text and tool bursts chronologically (CLI-style)", async () => {
+    const tc = (id: string, title: string): acp.SessionUpdate => ({
+      sessionUpdate: "tool_call",
+      toolCallId: id,
+      title,
+      kind: "read",
+      status: "in_progress",
+    });
+    const txt = (text: string): acp.SessionUpdate => ({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text },
+    });
+    const script: TurnScript[] = [
+      [
+        { update: txt("intro") },
+        { update: tc("a", "Tool A") },
+        { update: txt("middle") },
+        { update: tc("b", "Tool B") },
+        // A late status update for the SEALED first panel must still reach it.
+        {
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "a",
+            status: "completed",
+          },
+        },
+        { update: txt("outro") },
+      ],
+    ];
+    const { topic, ui } = await makeTopic(script);
+    await topic.handleUserPrompt([{ type: "text", text: "go" }]);
+
+    // Surface creation order = conversation order:
+    // draft("intro"), panel(A), draft("middle"), panel(B), draft("outro").
+    expect(ui.apis).toHaveLength(5);
+    expect(latest(ui.apis[0]!)).toContain("intro");
+    expect(allContent(ui.apis[1]!)).toContain("Tool A");
+    expect(latest(ui.apis[2]!)).toContain("middle");
+    expect(allContent(ui.apis[3]!)).toContain("Tool B");
+    expect(allContent(ui.apis[3]!)).not.toContain("Tool A"); // separate bursts
+    expect(latest(ui.apis[4]!)).toContain("outro");
+    // The sealed first panel reflected the late completion (✅, not ❌ from
+    // the end-of-turn in_progress sweep).
+    expect(latest(ui.apis[1]!)).toContain("✅");
+    expect(latest(ui.apis[1]!)).not.toContain("❌");
   });
 
   it("queues a second prompt FIFO and runs it after the first (order preserved)", async () => {

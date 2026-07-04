@@ -112,9 +112,18 @@ export class TopicSession {
   #cancelledTurn = false;
   readonly #queue: acp.ContentBlock[][] = [];
 
-  // Per-turn surfaces (undefined between turns).
+  // Per-turn surfaces (reset between turns). Text and tool calls interleave
+  // CHRONOLOGICALLY, mirroring the Claude Code CLI: a text segment streams
+  // into the current draft until a tool call arrives — that finalizes the
+  // draft and opens an Activity panel; when text resumes, the panel is sealed
+  // (no NEW rows) and a fresh draft starts below it. Updates for a sealed
+  // panel's tool calls still reach it via #activityOwner, since status
+  // changes (running → done) arrive long after the panel was sealed.
   #draft: MessageDraft | undefined;
+  #draftHasContent = false;
   #activity: ActivityRenderer | undefined;
+  readonly #activityPanels: ActivityRenderer[] = [];
+  readonly #activityOwner = new Map<string, ActivityRenderer>();
   #plan: PlanRenderer | undefined;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
 
@@ -177,20 +186,41 @@ export class TopicSession {
   handleUpdate(u: acp.SessionUpdate): void {
     switch (u.sessionUpdate) {
       case "agent_message_chunk":
-        if (u.content.type === "text") this.#draft?.append(u.content.text);
+        if (u.content.type === "text") this.#appendText(u.content.text);
         break;
       case "agent_thought_chunk":
         if (this.#cfg.showThoughts && u.content.type === "text") {
           const line = oneLineThought(u.content.text);
-          if (line) this.#draft?.append(`\n*${line}*\n`);
+          if (line) this.#appendText(`\n*${line}*\n`);
         }
         break;
-      case "tool_call":
-        this.#activityRenderer().onToolCall(u);
+      case "tool_call": {
+        // Text → tools boundary: finalize the current text segment so the
+        // Activity panel lands BELOW it, in conversation order.
+        if (this.#draft && this.#draftHasContent) {
+          const d = this.#draft;
+          this.#draft = undefined;
+          this.#draftHasContent = false;
+          void d.finalize().catch((e) => logError("segment finalize failed", e));
+        }
+        const panel = this.#activityRenderer();
+        this.#activityOwner.set(u.toolCallId, panel);
+        panel.onToolCall(u);
         break;
-      case "tool_call_update":
-        this.#activityRenderer().onToolCallUpdate(u);
+      }
+      case "tool_call_update": {
+        // Route to the panel that owns this call — it may already be sealed
+        // (text resumed) but must keep reflecting status changes. An unknown
+        // id (update-before-call, which the protocol allows) opens the
+        // current panel.
+        let panel = this.#activityOwner.get(u.toolCallId);
+        if (!panel) {
+          panel = this.#activityRenderer();
+          this.#activityOwner.set(u.toolCallId, panel);
+        }
+        panel.onToolCallUpdate(u);
         break;
+      }
       case "plan":
         this.#planRenderer().onPlan(u);
         break;
@@ -264,16 +294,33 @@ export class TopicSession {
     }
   }
 
+  /** Append streamed text, starting a fresh segment draft when needed. */
+  #appendText(mdText: string): void {
+    // Tools → text boundary: seal the current Activity panel. It keeps
+    // receiving updates for its OWN calls via #activityOwner, but the next
+    // tool_call opens a new panel below this text segment.
+    this.#activity = undefined;
+    if (!this.#draft) {
+      this.#draft = new MessageDraft(this.#ui.messageApi(), {
+        intervalMs: this.#cfg.editIntervalMs,
+        maxLen: RICH_MAX_LEN,
+        render: mdToRichHtml,
+      });
+      this.#draftHasContent = false;
+    }
+    this.#draft.append(mdText);
+    this.#draftHasContent = true;
+  }
+
   async #runOneTurn(blocks: acp.ContentBlock[]): Promise<void> {
     // Each new turn is a fresh consent context: a cancel() from a prior turn
     // must not shadow permission requests belonging to this one.
     this.#cancelledTurn = false;
-    this.#draft = new MessageDraft(this.#ui.messageApi(), {
-      intervalMs: this.#cfg.editIntervalMs,
-      maxLen: RICH_MAX_LEN,
-      render: mdToRichHtml,
-    });
+    this.#draft = undefined;
+    this.#draftHasContent = false;
     this.#activity = undefined;
+    this.#activityPanels.length = 0;
+    this.#activityOwner.clear();
     this.#plan = undefined;
     this.#startHeartbeat();
 
@@ -297,7 +344,10 @@ export class TopicSession {
     } finally {
       this.#stopHeartbeat();
       this.#draft = undefined;
+      this.#draftHasContent = false;
       this.#activity = undefined;
+      this.#activityPanels.length = 0;
+      this.#activityOwner.clear();
       this.#plan = undefined;
     }
   }
@@ -305,7 +355,11 @@ export class TopicSession {
   async #finalizeRenderers(): Promise<void> {
     try {
       await this.#draft?.finalize();
-      await this.#activity?.finalizeTurn();
+      // EVERY panel of the turn (sealed ones included): flush + mark any
+      // still-running rows as not finishing.
+      for (const panel of this.#activityPanels) {
+        await panel.finalizeTurn();
+      }
       await this.#plan?.finalizeTurn();
     } catch (e) {
       logError("finalize failed", e);
@@ -317,6 +371,7 @@ export class TopicSession {
       this.#activity = new ActivityRenderer(
         new LiveMessage(this.#ui.messageApi(), this.#cfg.editIntervalMs, RICH_MAX_LEN),
       );
+      this.#activityPanels.push(this.#activity);
     }
     return this.#activity;
   }
