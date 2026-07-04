@@ -230,7 +230,11 @@ export function mdToRichHtml(md: string): string {
       while (i < lines.length) {
         const m = BLOCKQUOTE_RE.exec(lines[i]);
         if (!m) break;
-        quoted.push(renderInline(m[1]));
+        // `<h1>`-`<h6>` can't nest inside `<blockquote>` in Rich HTML, so a
+        // `# heading` line inside a quote is rendered bold instead of literally
+        // passing its `#` markers through as text.
+        const heading = HEADING_RE.exec(m[1]);
+        quoted.push(heading ? `<b>${renderInline(heading[2])}</b>` : renderInline(m[1]));
         i++;
       }
       out.push(`<blockquote>${quoted.join("<br/>")}</blockquote>`);

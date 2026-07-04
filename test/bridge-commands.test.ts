@@ -192,6 +192,30 @@ describe("Bridge", () => {
     expect(botApi.topics).toHaveLength(0);
   });
 
+  it("newTopic closes the orphaned topic and notifies via reply when the agent spawn fails", async () => {
+    // Regression (T15 review): createForumTopic succeeds, then #spawnTopic
+    // throws — the new topic was never stored (so no Reconnect path exists
+    // for it) and, before this fix, was left open forever.
+    const cfg = makeConfig();
+    const botApi = new FakeBotApi();
+    const store = new StateStore(join(dir, "state.json"));
+    const starter: AgentStarter = async () => {
+      throw new Error("spawn boom");
+    };
+    const bridge = new Bridge(cfg, botApi, store, starter);
+    const replies: string[] = [];
+
+    await bridge.newTopic(undefined, async (h) => void replies.push(h));
+
+    expect(botApi.topics).toHaveLength(1);
+    const t1 = botApi.topics[0]!.threadId;
+    expect(store.get(t1)).toBeUndefined(); // never stored
+    expect(botApi.htmlFor(t1).join("\n")).toContain("could not start the agent");
+    expect(botApi.closed).toContain(t1); // best-effort close
+    // The command issuer (wherever /new was invoked) also sees the failure.
+    expect(replies.some((r) => /could not start the agent/.test(r))).toBe(true);
+  });
+
   it("routes text to the right TopicSession across two interleaved topics", async () => {
     const { bridge, botApi, mocks } = makeBridge();
     await bridge.newTopic(undefined, async () => {});
@@ -309,6 +333,56 @@ describe("Bridge", () => {
 
     expect(mocks[0]!.received).toHaveLength(2);
     expect(textOf(mocks[0]!, 1)).toBe("/pr-comments 123");
+  });
+
+  describe("/status", () => {
+    it("shows model and effort lines with resolved display names by default", async () => {
+      const { bridge, botApi } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/status" });
+      const html = botApi.htmlFor(t1).join("\n");
+      expect(html).toContain("model: Default");
+      expect(html).toContain("effort: Default");
+    });
+
+    it("omits the model/effort lines when the agent stops advertising those options", async () => {
+      const { bridge, botApi, mocks } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      // Script the next turn to replace the cached config options with one that
+      // no longer includes a model/effort select — currentConfigValue then
+      // returns undefined, and the corresponding /status line must disappear
+      // entirely rather than showing a placeholder.
+      mocks[0]!.script = [
+        [
+          {
+            update: {
+              sessionUpdate: "config_option_update",
+              configOptions: [
+                {
+                  id: "mode",
+                  name: "Mode",
+                  category: "mode",
+                  type: "select",
+                  currentValue: "default",
+                  options: [{ value: "default", name: "Default" }],
+                },
+              ],
+            },
+          },
+        ],
+      ];
+      await bridge.handleMessage(t1, { text: "trigger" });
+      await tick();
+
+      await bridge.handleMessage(t1, { text: "/status" });
+      const html = botApi.htmlFor(t1).join("\n");
+      expect(html).not.toMatch(/model:/);
+      expect(html).not.toMatch(/effort:/);
+    });
   });
 
   it("/end disposes the session, removes the store entry, and closes the topic", async () => {

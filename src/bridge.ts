@@ -369,7 +369,13 @@ export class Bridge {
       session = await this.#spawnTopic(threadId, cwd, undefined);
     } catch (e) {
       logError("newTopic agent start failed", e);
-      await this.#send(threadId, "💥 could not start the agent — /new to retry.");
+      const notice = "💥 could not start the agent — /new to retry.";
+      await this.#send(threadId, notice);
+      // The topic is never stored (no Reconnect path exists for it), so leaving
+      // it open would orphan an empty topic forever — best-effort close, never
+      // fail the flow over it.
+      await this.#botApi.closeForumTopic(threadId).catch((e) => logError("closeForumTopic", e));
+      await reply(notice);
       return;
     }
 
@@ -671,6 +677,12 @@ export class Bridge {
       `cwd: <code>${escapeHtml(stored?.cwd ?? this.#cfg.defaultCwd)}</code>`,
       `mode: ${escapeHtml(agent.currentModeId ?? "default")}`,
     ];
+    for (const key of ["model", "effort"] as const) {
+      const value = agent.currentConfigValue(key);
+      if (value === undefined) continue;
+      const name = agent.availableConfigValues(key).find((v) => v.id === value)?.name ?? value;
+      lines.push(`${key}: ${escapeHtml(name)}`);
+    }
     const u = session.lastUsage;
     if (u) {
       let usage = `usage: ${u.used}/${u.size} tokens`;
