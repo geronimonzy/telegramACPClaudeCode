@@ -110,6 +110,9 @@ const MAX_TITLE_LEN = 64;
 /** How often the 📊 Claude Usage panel refreshes itself (edit-only). */
 const USAGE_REFRESH_MS = 60 * 60 * 1000;
 
+/** Display labels for the select config options the bridge exposes as commands. */
+const CONFIG_LABELS: Record<string, string> = { model: "Model", effort: "Effort" };
+
 /** Expand a leading `~` / `~/` to the user's home directory. */
 function expandHome(p: string): string {
   if (p === "~" || p.startsWith("~/")) return path.join(homedir(), p.slice(1));
@@ -124,6 +127,8 @@ export const COMMAND_LIST: Array<{ command: string; description: string }> = [
   { command: "end", description: "End this session and close the topic" },
   { command: "cancel", description: "Cancel the in-flight turn" },
   { command: "mode", description: "Choose the agent mode" },
+  { command: "model", description: "Choose the model" },
+  { command: "effort", description: "Choose the reasoning effort" },
   { command: "yolo", description: "Toggle bypass-permissions mode" },
   { command: "status", description: "Show session status" },
   { command: "commands", description: "List agent-supported commands" },
@@ -480,6 +485,7 @@ export class Bridge {
   ): Promise<{ toast: string } | undefined> {
     if (data.startsWith("perm:")) return this.#handlePermCallback(data, callbackMessageId);
     if (data.startsWith("mode:")) return this.#handleModeCallback(data, callbackMessageId);
+    if (data.startsWith("cfg:")) return this.#handleConfigCallback(data, callbackMessageId);
     if (data.startsWith("reconnect:")) return this.#handleReconnectCallback(data);
     if (data.startsWith("compact:")) return this.#handleCompactCallback(data, callbackMessageId);
     if (data.startsWith("continue:")) return this.#handleContinueCallback(data, callbackMessageId);
@@ -526,6 +532,12 @@ export class Bridge {
         return;
       case "mode":
         await this.#send(threadId, "Choose a mode:", this.#modeKeyboard(threadId, agent));
+        return;
+      case "model":
+        await this.#sendConfigKeyboard(threadId, agent, "model");
+        return;
+      case "effort":
+        await this.#sendConfigKeyboard(threadId, agent, "effort");
         return;
       case "yolo":
         await this.#yolo(threadId, agent);
@@ -888,6 +900,35 @@ export class Bridge {
         .catch((e) => logError("continue edit failed", e));
     }
     return { toast: "continuing" };
+  }
+
+  /** Set a select config option from a `cfg:{threadId}:{key}:{value}` tap. */
+  async #handleConfigCallback(
+    data: string,
+    callbackMessageId: number | undefined,
+  ): Promise<{ toast: string }> {
+    const m = /^cfg:(\d+):(\w+):(.+)$/.exec(data);
+    if (!m) return { toast: "" };
+    const threadId = Number(m[1]);
+    const key = m[2]!;
+    const value = m[3]!;
+    const session = this.#sessions.get(threadId);
+    if (!session) return { toast: "no session" };
+    try {
+      await session.agentSession.setConfigValue(key, value);
+    } catch (e) {
+      logError("config callback failed", e);
+      return { toast: "failed" };
+    }
+    const label = CONFIG_LABELS[key] ?? key;
+    const name =
+      session.agentSession.availableConfigValues(key).find((v) => v.id === value)?.name ?? value;
+    if (callbackMessageId !== undefined) {
+      await this.#botApi
+        .editMessageText(callbackMessageId, `${label}: <b>${escapeHtml(name)}</b>`)
+        .catch((e) => logError("config edit failed", e));
+    }
+    return { toast: `${label}: ${name}` };
   }
 
   async #handleRestartCallback(data: string): Promise<{ toast: string }> {
@@ -1290,6 +1331,26 @@ export class Bridge {
         .availableModes()
         .map((m) => [{ text: m.name, callback_data: `mode:${threadId}:${m.id}` }]),
     };
+  }
+
+  /** Offer a select config option (`/model`, `/effort`) as an inline keyboard. */
+  async #sendConfigKeyboard(threadId: number, agent: AgentSession, key: string): Promise<void> {
+    const label = CONFIG_LABELS[key] ?? key;
+    const values = agent.availableConfigValues(key);
+    if (values.length === 0) {
+      await this.#send(threadId, `⚠️ this agent does not expose ${label.toLowerCase()} selection.`);
+      return;
+    }
+    const current = agent.currentConfigValue(key);
+    const rows = values.map((v) => [
+      {
+        text: `${v.id === current ? "✅ " : ""}${v.name}`,
+        callback_data: `cfg:${threadId}:${key}:${v.id}`,
+      },
+    ]);
+    const noun = label.toLowerCase();
+    const article = /^[aeiou]/.test(noun) ? "an" : "a";
+    await this.#send(threadId, `Choose ${article} ${noun}:`, { inline_keyboard: rows });
   }
 
   /** Start an AgentSession wired to a fresh TopicSession for `threadId`. */

@@ -244,6 +244,33 @@ export class AgentSession {
   }
 
   /**
+   * The selectable values of a select config option, addressed by category OR
+   * id (`"model"`, `"effort"`/`"thought_level"`, …). Empty when the agent does
+   * not advertise such an option.
+   */
+  availableConfigValues(key: string): Array<{ id: string; name: string }> {
+    const opt = this.#selectConfigOption(key);
+    if (!opt) return [];
+    return flattenSelectOptions(opt.options).map((o) => ({ id: o.value, name: o.name }));
+  }
+
+  /** The current value of a select config option (by category or id). */
+  currentConfigValue(key: string): string | undefined {
+    return this.#selectConfigOption(key)?.currentValue;
+  }
+
+  /** Set a select config option (by category or id); throws when unknown. */
+  async setConfigValue(key: string, value: string): Promise<void> {
+    const opt = this.#selectConfigOption(key);
+    if (!opt) throw new Error(`agent does not advertise a "${key}" config option`);
+    await this.#conn.setSessionConfigOption({
+      sessionId: this.#sessionId,
+      configId: opt.id,
+      value,
+    });
+  }
+
+  /**
    * Terminate the subprocess (SIGTERM, then SIGKILL after a grace period) and
    * release resources. Safe when there is no subprocess (stream-injected mode).
    */
@@ -325,7 +352,14 @@ export class AgentSession {
   #modeConfigOption():
     | (acp.SessionConfigOption & { type: "select" })
     | undefined {
-    const opt = this.#configOptions.find((o) => o.category === "mode");
+    return this.#selectConfigOption("mode");
+  }
+
+  /** A select config option matched by category first, then by id. */
+  #selectConfigOption(key: string): (acp.SessionConfigOption & { type: "select" }) | undefined {
+    const opt =
+      this.#configOptions.find((o) => o.category === key) ??
+      this.#configOptions.find((o) => o.id === key);
     return opt && opt.type === "select" ? opt : undefined;
   }
 

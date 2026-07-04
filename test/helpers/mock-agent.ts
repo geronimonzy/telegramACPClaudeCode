@@ -34,17 +34,52 @@ const AVAILABLE_MODES: acp.SessionMode[] = [
   { id: "acceptEdits", name: "Accept Edits" },
 ];
 
-function buildConfigOptions(currentValue: string): acp.SessionConfigOption[] {
-  return [
-    {
-      id: "mode",
-      name: "Mode",
-      category: "mode",
-      type: "select",
-      currentValue,
-      options: AVAILABLE_MODES.map((m) => ({ value: m.id, name: m.name })),
-    },
-  ];
+/** The select config options the mock advertises (mirrors claude-agent-acp). */
+const CONFIG_CATALOG: Array<{
+  id: string;
+  name: string;
+  category?: string;
+  options: Array<{ value: string; name: string }>;
+}> = [
+  {
+    id: "mode",
+    name: "Mode",
+    category: "mode",
+    options: AVAILABLE_MODES.map((m) => ({ value: m.id, name: m.name })),
+  },
+  {
+    id: "model",
+    name: "Model",
+    category: "model",
+    options: [
+      { value: "default", name: "Default" },
+      { value: "sonnet", name: "Sonnet" },
+      { value: "opus", name: "Opus" },
+    ],
+  },
+  {
+    id: "effort",
+    name: "Effort",
+    // The real adapter categorizes effort as "thought_level" with id "effort";
+    // mirror that so id-based lookup is what tests exercise.
+    category: "thought_level",
+    options: [
+      { value: "default", name: "Default" },
+      { value: "high", name: "High" },
+      { value: "max", name: "Max" },
+    ],
+  },
+];
+
+function buildConfigOptions(values: Map<string, string>): acp.SessionConfigOption[] {
+  return CONFIG_CATALOG.map((c) => ({
+    id: c.id,
+    name: c.name,
+    ...(c.category ? { category: c.category } : {}),
+    type: "select" as const,
+    currentValue: values.get(c.id) ?? "default",
+    options: c.options,
+  }));
 }
 
 /**
@@ -79,6 +114,8 @@ export class MockAgent implements acp.Agent {
   listSessionsResponse: acp.SessionInfo[] = [];
 
   #currentModeId = "default";
+  /** Current value per select config option id (mode/model/effort). */
+  readonly configValues = new Map<string, string>();
   #conn: () => acp.AgentSideConnection;
 
   constructor(conn: () => acp.AgentSideConnection) {
@@ -103,8 +140,14 @@ export class MockAgent implements acp.Agent {
         currentModeId: this.#currentModeId,
         availableModes: AVAILABLE_MODES,
       },
-      configOptions: buildConfigOptions(this.#currentModeId),
+      configOptions: this.#configOptions(),
     };
+  }
+
+  #configOptions(): acp.SessionConfigOption[] {
+    const values = new Map(this.configValues);
+    values.set("mode", this.#currentModeId);
+    return buildConfigOptions(values);
   }
 
   async loadSession(params: acp.LoadSessionRequest): Promise<acp.LoadSessionResponse> {
@@ -120,7 +163,7 @@ export class MockAgent implements acp.Agent {
         currentModeId: this.#currentModeId,
         availableModes: AVAILABLE_MODES,
       },
-      configOptions: buildConfigOptions(this.#currentModeId),
+      configOptions: this.#configOptions(),
     };
   }
 
@@ -147,9 +190,10 @@ export class MockAgent implements acp.Agent {
     params: acp.SetSessionConfigOptionRequest,
   ): Promise<acp.SetSessionConfigOptionResponse> {
     if (typeof params.value === "string") {
-      this.#currentModeId = params.value;
+      this.configValues.set(params.configId, params.value);
+      if (params.configId === "mode") this.#currentModeId = params.value;
     }
-    const configOptions = buildConfigOptions(this.#currentModeId);
+    const configOptions = this.#configOptions();
     await this.#conn().sessionUpdate({
       sessionId: params.sessionId,
       update: { sessionUpdate: "config_option_update", configOptions },

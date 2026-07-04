@@ -497,6 +497,53 @@ describe("Bridge", () => {
     expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
   });
 
+  describe("/model and /effort", () => {
+    it("/model offers the advertised models (current ✅-marked); tapping sets it", async () => {
+      const { bridge, botApi, mocks } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/model" });
+      const prompt = botApi.messages.find((m) => /Choose a model/.test(m.html))!;
+      expect(prompt).toBeDefined();
+      const rows = prompt.keyboard!.inline_keyboard;
+      expect(rows.map((r) => r[0]!.callback_data)).toEqual([
+        `cfg:${t1}:model:default`,
+        `cfg:${t1}:model:sonnet`,
+        `cfg:${t1}:model:opus`,
+      ]);
+      // Current value carries the checkmark.
+      expect(rows[0]![0]!.text).toBe("✅ Default");
+
+      const res = await bridge.handleCallback(`cfg:${t1}:model:opus`, prompt.messageId);
+      expect(res?.toast).toBe("Model: Opus");
+      expect(mocks[0]!.configValues.get("model")).toBe("opus");
+      expect(
+        botApi.edits.some((e) => e.messageId === prompt.messageId && /Model: <b>Opus<\/b>/.test(e.html)),
+      ).toBe(true);
+    });
+
+    it("/effort resolves via the option id when the category differs (thought_level)", async () => {
+      const { bridge, botApi, mocks } = makeBridge();
+      await bridge.newTopic(undefined, async () => {});
+      const t1 = botApi.topics[0]!.threadId;
+
+      await bridge.handleMessage(t1, { text: "/effort" });
+      const prompt = botApi.messages.find((m) => /Choose an? effort/.test(m.html))!;
+      expect(prompt).toBeDefined();
+
+      const res = await bridge.handleCallback(`cfg:${t1}:effort:max`, prompt.messageId);
+      expect(res?.toast).toBe("Effort: Max");
+      expect(mocks[0]!.configValues.get("effort")).toBe("max");
+    });
+
+    it("cfg: tap for a topic without a session toasts and does nothing", async () => {
+      const { bridge } = makeBridge();
+      const res = await bridge.handleCallback("cfg:12345:model:opus", 1);
+      expect(res?.toast).toBe("no session");
+    });
+  });
+
   describe("/usage", () => {
     it("creates the 📊 topic, posts + pins the stats message, persists across bridges", async () => {
       const { bridge, botApi } = makeBridge();
