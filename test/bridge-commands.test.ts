@@ -119,13 +119,67 @@ describe("Bridge", () => {
     expect(botApi.topics).toHaveLength(0);
   });
 
-  it("/new <unknown project> lists known projects and creates nothing", async () => {
+  it("/new <project> <name…> uses the words after the folder as the topic title", async () => {
+    const { bridge, botApi, store, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
+    await bridge.newTopic("myproj Design Requirements", async () => {});
+    expect(botApi.topics).toHaveLength(1);
+    expect(botApi.topics[0]!.name).toBe("Design Requirements");
+    const entry = store.get(botApi.topics[0]!.threadId);
+    expect(entry?.title).toBe("Design Requirements");
+    expect(entry?.cwd).toBe(dir);
+  });
+
+  it("/new resolves a bare word as a directory under defaultCwd", async () => {
+    const { bridge, botApi, store } = makeBridge();
+    await mkdir(join(dir, "receiptSaas"), { recursive: true });
+    await bridge.newTopic("receiptSaas DesignRequirements", async () => {});
+    expect(botApi.topics).toHaveLength(1);
+    expect(botApi.topics[0]!.name).toBe("DesignRequirements");
+    expect(store.get(botApi.topics[0]!.threadId)?.cwd).toBe(join(dir, "receiptSaas"));
+  });
+
+  it("a project key wins over a same-named defaultCwd subdirectory", async () => {
+    const { bridge, botApi, store, cfg } = makeBridge();
+    const projDir = await mkdtemp(join(tmpdir(), "bridge-proj-"));
+    cfg.projects = { receiptSaas: projDir };
+    await mkdir(join(dir, "receiptSaas"), { recursive: true });
+    await bridge.newTopic("receiptSaas", async () => {});
+    expect(store.get(botApi.topics[0]!.threadId)?.cwd).toBe(projDir);
+    await rm(projDir, { recursive: true, force: true });
+  });
+
+  it("/new with a path and no title still gets a random three-word name", async () => {
+    const { bridge, botApi } = makeBridge();
+    await bridge.newTopic(dir, async () => {});
+    expect(botApi.topics[0]!.name).toMatch(NAME_RE);
+  });
+
+  it("an over-long custom title is truncated to the topic-title cap", async () => {
+    const { bridge, botApi, cfg } = makeBridge();
+    cfg.projects = { myproj: dir };
+    await bridge.newTopic(`myproj ${"t".repeat(200)}`, async () => {});
+    expect(botApi.topics[0]!.name.length).toBeLessThanOrEqual(64);
+    expect(botApi.topics[0]!.name.endsWith("…")).toBe(true);
+  });
+
+  it("an unresolvable folder word errors with the [folder] [name…] usage", async () => {
+    const { bridge, botApi } = makeBridge();
+    const replies: string[] = [];
+    await bridge.newTopic("noSuchThing SomeName", async (h) => void replies.push(h));
+    const err = replies.join("\n");
+    expect(err).toContain("unknown folder");
+    expect(err).toContain("[folder] [name…]");
+    expect(botApi.topics).toHaveLength(0);
+  });
+
+  it("/new <unknown folder> lists known projects and creates nothing", async () => {
     const { bridge, botApi, cfg } = makeBridge();
     cfg.projects = { alpha: dir, beta: dir };
     const replies: string[] = [];
     await bridge.newTopic("nope", async (h) => void replies.push(h));
     const html = replies.join("\n");
-    expect(html).toContain("unknown project");
+    expect(html).toContain("unknown folder");
     expect(html).toContain("alpha");
     expect(html).toContain("beta");
     expect(botApi.topics).toHaveLength(0);

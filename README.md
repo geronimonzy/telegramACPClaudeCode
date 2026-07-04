@@ -91,7 +91,7 @@ Copy `config.example.json` (or let `install.sh` do it — see below) to
 | `forumChatId` | number | yes | — | The forum supergroup's chat id (see step 4). |
 | `allowedUserIds` | number[] | yes (non-empty) | — | Telegram user ids allowed to interact with the bridge. Everyone else is ignored. |
 | `defaultCwd` | string | yes | — | Working directory for a new session when `/new` is given no argument. |
-| `projects` | object (string → string) | no | `{}` | Named shortcuts: `/new <name>` uses `projects[name]` as the cwd. `/new` also accepts an absolute or `~` path directly. |
+| `projects` | object (string → string) | no | `{}` | Named shortcuts: `/new <name>` uses `projects[name]` as the cwd. `/new` also accepts an absolute or `~` path, or a directory name under `defaultCwd`. |
 | `editIntervalMs` | number | no | `1500` | Minimum interval between live-message edits while a response streams. |
 | `typingIntervalMs` | number | no | `4500` | Interval for refreshing the "typing…" chat action while a turn is in flight. |
 | `showThoughts` | boolean | no | `false` | Forward the agent's thinking/reasoning blocks to Telegram. |
@@ -163,7 +163,7 @@ regardless of the working directory chosen.
 
 | Command | Description |
 |---|---|
-| `/new [path\|project]` | Start a new session topic. With no argument the cwd is `defaultCwd`. An absolute or `~` path selects that directory (it must exist). Any other argument must be a key in `projects`. The topic gets a random three-word title either way. |
+| `/new [folder] [name…]` | Start a new session topic. The first word picks the working directory: an absolute or `~` path (must exist), a key in `projects`, or a directory under `defaultCwd`. Everything after it becomes the topic title (e.g. `/new receiptSaas Design Requirements`); with no title the topic gets a random three-word name. With no arguments at all: `defaultCwd` + random name. |
 | `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic, replays the session's **full** history as a readable transcript, and goes live. Works from General or any topic. |
 | `/end` | End this session and close the topic. |
 | `/cancel` | Cancel the in-flight turn. |

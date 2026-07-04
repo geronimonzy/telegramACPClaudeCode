@@ -104,7 +104,7 @@ function expandHome(p: string): string {
 
 /** The command list registered with Telegram (BotCommandScopeChat in bot.ts). */
 export const COMMAND_LIST: Array<{ command: string; description: string }> = [
-  { command: "new", description: "Start a new session topic (optional path/project)" },
+  { command: "new", description: "Start a session topic: /new [folder] [name…]" },
   { command: "sessions", description: "List resumable sessions to attach" },
   { command: "end", description: "End this session and close the topic" },
   { command: "cancel", description: "Cancel the in-flight turn" },
@@ -175,6 +175,21 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
 }
 
+/**
+ * Split `/new`'s argument into `[folder, title]`: the first whitespace-
+ * delimited word selects the working directory; everything after it is the
+ * topic title. Either part may be absent (`undefined`).
+ */
+function splitFolderAndTitle(
+  arg: string | undefined,
+): [string | undefined, string | undefined] {
+  if (!arg) return [undefined, undefined];
+  const sp = arg.search(/\s/);
+  if (sp === -1) return [arg, undefined];
+  const title = arg.slice(sp + 1).trim();
+  return [arg.slice(0, sp), title === "" ? undefined : title];
+}
+
 export class Bridge {
   readonly #cfg: Config;
   readonly #botApi: BotApi;
@@ -236,21 +251,23 @@ export class Bridge {
   }
 
   /**
-   * Create a new forum topic + agent session. `arg` selects the working
-   * directory (an absolute/`~` path that must exist, or a `cfg.projects` key);
-   * the topic TITLE is always a random three-word name. `reply` targets
-   * whichever topic the `/new` was issued from (General or a session topic);
-   * the substantive intro is sent into the newly created topic.
+   * Create a new forum topic + agent session. `arg` is `[folder] [name…]`:
+   * the first word selects the working directory (an absolute/`~` path, a
+   * `cfg.projects` key, or a directory under `defaultCwd`); anything after it
+   * becomes the topic title. With no title the topic gets a random three-word
+   * name. `reply` targets whichever topic the `/new` was issued from (General
+   * or a session topic); the substantive intro is sent into the new topic.
    */
   async newTopic(
     arg: string | undefined,
     reply: (html: string) => Promise<void>,
   ): Promise<void> {
-    const cwd = await this.#resolveNewCwd(arg, reply);
+    const [folderArg, titleArg] = splitFolderAndTitle(arg);
+    const cwd = await this.#resolveNewCwd(folderArg, reply);
     if (cwd === undefined) return; // an error reply was already sent; create nothing.
 
     const n = ++this.#seq;
-    const title = randomName();
+    const title = titleArg !== undefined ? truncate(titleArg, MAX_TITLE_LEN) : randomName();
     const iconColor = ICON_COLORS[(n - 1) % ICON_COLORS.length]!;
 
     let threadId: number;
@@ -302,12 +319,13 @@ export class Bridge {
   }
 
   /**
-   * Resolve the working directory for `/new <arg>`. Returns the cwd, or
-   * `undefined` after sending an error reply (caller then creates nothing):
-   *   - no arg → defaultCwd;
-   *   - arg starting with `/` or `~` → expanded path that MUST be an existing
+   * Resolve the working directory for `/new`'s folder word. Returns the cwd,
+   * or `undefined` after sending an error reply (caller then creates nothing):
+   *   - no folder → defaultCwd;
+   *   - starting with `/` or `~` → expanded path that MUST be an existing
    *     directory (else `⚠️ not a directory: <path>`);
-   *   - otherwise → a `cfg.projects` key (else list the known projects).
+   *   - otherwise → a `cfg.projects` key, else a directory under `defaultCwd`
+   *     (zero-config folder selection), else a usage error.
    */
   async #resolveNewCwd(
     arg: string | undefined,
@@ -333,12 +351,23 @@ export class Bridge {
     const mapped = this.#cfg.projects[arg];
     if (mapped) return mapped;
 
+    // A bare word can also name a directory under defaultCwd — zero-config
+    // folder selection (`/new receiptSaas …` → {defaultCwd}/receiptSaas).
+    const sub = path.join(this.#cfg.defaultCwd, arg);
+    try {
+      const st = await stat(sub);
+      if (st.isDirectory()) return sub;
+    } catch {
+      // not a directory under defaultCwd either → usage error below
+    }
+
     const known = Object.keys(this.#cfg.projects);
     const list = known.length > 0 ? known.map((k) => `<code>${escapeHtml(k)}</code>`).join(", ") : "(none)";
     await reply(
-      `⚠️ unknown project: <code>${escapeHtml(arg)}</code>\n` +
-        `Known projects: ${list}\n` +
-        `Absolute paths (starting with <code>/</code> or <code>~</code>) are also accepted.`,
+      `⚠️ unknown folder: <code>${escapeHtml(arg)}</code>\n` +
+        `Usage: <code>/new [folder] [name…]</code> — the first word picks the working directory, the rest names the topic.\n` +
+        `Folder can be a project (${list}), an absolute or <code>~</code> path, ` +
+        `or a directory under <code>${escapeHtml(this.#cfg.defaultCwd)}</code>.`,
     );
     return undefined;
   }
