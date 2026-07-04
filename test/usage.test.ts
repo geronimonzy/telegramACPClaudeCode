@@ -85,6 +85,12 @@ describe("fmtTokens", () => {
     expect(fmtTokens(12345)).toBe("12.3k");
     expect(fmtTokens(1234567)).toBe("1.2M");
   });
+
+  it("drops the decimal from three-digit mantissas (table width)", () => {
+    expect(fmtTokens(460_900_000)).toBe("461M");
+    expect(fmtTokens(123_400)).toBe("123k");
+    expect(fmtTokens(99_940)).toBe("99.9k");
+  });
 });
 
 describe("renderUsageRich", () => {
@@ -117,9 +123,12 @@ describe("renderUsageRich", () => {
     );
     expect(html).toContain("<h3>📊 Claude usage</h3>");
     expect(html).toContain("<table>");
+    // 4 columns: model | in/out | cache r/w | msgs (5 overflowed on phones).
+    expect(html).toContain("<tr><th>model</th><th>in/out</th><th>cache r/w</th><th>msgs</th></tr>");
     expect(html).toContain("opus-4-8"); // claude- prefix stripped
-    expect(html).toContain("63.0k/200.0k");
-    expect(html).toContain("context unknown");
+    expect(html).toContain("<td>100/10</td>"); // merged in/out cell
+    expect(html).toContain("63.0k/200k");
+    expect(html).toContain("<b>no-usage-yet</b> — –");
     expect(isBalanced(html)).toBe(true);
   });
 

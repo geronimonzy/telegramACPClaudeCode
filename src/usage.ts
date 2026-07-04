@@ -147,10 +147,17 @@ export async function collectUsageStats(
   return stats;
 }
 
-/** 12345 → "12.3k", 1234567 → "1.2M"; exact below 1000. */
+/**
+ * 12345 → "12.3k", 1234567 → "1.2M", 460900000 → "461M"; exact below 1000.
+ * The decimal is dropped from three-digit mantissas — Telegram renders rich
+ * tables at their natural width with horizontal scroll, so every char of the
+ * widest cell costs real screen estate.
+ */
 export function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  const scale = (v: number, suffix: string): string =>
+    `${v >= 100 ? Math.round(v) : v.toFixed(1)}${suffix}`;
+  if (n >= 1_000_000) return scale(n / 1_000_000, "M");
+  if (n >= 1_000) return scale(n / 1_000, "k");
   return String(n);
 }
 
@@ -161,14 +168,17 @@ export interface LiveSessionUsage {
   size?: number;
 }
 
+// Four columns max: Telegram renders rich tables at natural width and cuts
+// into horizontal scroll past the client width — a 5-column layout pushed the
+// last column off-screen on phones (live finding).
 function usageTable(map: Map<string, ModelUsage>): string {
   if (map.size === 0) return "<p>no usage</p>";
   const rows = [...map.entries()].sort((a, b) => b[1].output - a[1].output);
-  let t = "<table><tr><th>model</th><th>in</th><th>out</th><th>cache r/w</th><th>msgs</th></tr>";
+  let t = "<table><tr><th>model</th><th>in/out</th><th>cache r/w</th><th>msgs</th></tr>";
   for (const [model, u] of rows) {
     t +=
       `<tr><td>${escapeRich(model.replace(/^claude-/, ""))}</td>` +
-      `<td>${fmtTokens(u.input)}</td><td>${fmtTokens(u.output)}</td>` +
+      `<td>${fmtTokens(u.input)}/${fmtTokens(u.output)}</td>` +
       `<td>${fmtTokens(u.cacheRead)}/${fmtTokens(u.cacheWrite)}</td>` +
       `<td>${u.messages}</td></tr>`;
   }
@@ -191,10 +201,11 @@ export function renderUsageRich(
   if (live.length > 0) {
     const items = live
       .map((s) => {
+        // "–" = no usage_update seen yet (no turn since this process started).
         const ctx =
           s.used !== undefined && s.size !== undefined
             ? `${fmtTokens(s.used)}/${fmtTokens(s.size)}`
-            : "context unknown";
+            : "–";
         return `<li><b>${escapeRich(s.title)}</b> — ${ctx}</li>`;
       })
       .join("");
