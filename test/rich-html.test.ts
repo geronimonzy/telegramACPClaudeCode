@@ -4,6 +4,8 @@ import {
   mdToRichHtml,
   richDetails,
   fitDetailsList,
+  renderUserTurnRich,
+  renderAgentTurnRich,
 } from "../src/telegram/rich-html.js";
 
 // Void elements that legitimately have no closing tag in Rich HTML.
@@ -244,5 +246,26 @@ describe("fitDetailsList", () => {
     expect(out).toMatch(/<li><i>… \d+ earlier<\/i><\/li>/);
     expect(out).toContain("row number 199"); // newest survives
     expect(out).not.toContain("row number 0<"); // oldest dropped
+  });
+});
+
+describe("transcript turn renderers", () => {
+  it("renderUserTurnRich: bold blockquote, literal text, newlines → <br/>", () => {
+    const out = renderUserTurnRich("hi **there**\n<b>raw</b> & such");
+    expect(out.startsWith("<blockquote><b>👤 You")).toBe(true);
+    expect(out.endsWith("</b></blockquote>")).toBe(true);
+    expect(out).toContain("hi **there**"); // markdown NOT interpreted
+    expect(out).toContain("&lt;b&gt;raw&lt;/b&gt; &amp; such"); // html escaped
+    expect(out).toContain("<br/>");
+    expect(isBalanced(out)).toBe(true);
+  });
+
+  it("renderAgentTurnRich: 🤖 header then rendered markdown", () => {
+    const out = renderAgentTurnRich("# Hi\n\n**bold** and `code`");
+    expect(out.startsWith("<p>🤖</p>")).toBe(true);
+    expect(out).toContain("<h1>Hi</h1>");
+    expect(out).toContain("<b>bold</b>");
+    expect(out).toContain("<code>code</code>");
+    expect(isBalanced(out)).toBe(true);
   });
 });

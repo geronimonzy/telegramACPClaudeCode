@@ -24,7 +24,11 @@ import { log } from "./log.js";
 import { StateStore, type SessionState } from "./state.js";
 import { TopicSession, type TopicUi } from "./orchestrator.js";
 import { MessageDraft } from "./telegram/draft.js";
-import { mdToRichHtml, RICH_MAX_LEN } from "./telegram/rich-html.js";
+import {
+  renderAgentTurnRich,
+  renderUserTurnRich,
+  RICH_MAX_LEN,
+} from "./telegram/rich-html.js";
 import { randomName } from "./telegram/names.js";
 import { PermissionBroker } from "./telegram/permissions.js";
 import type { MessageApi } from "./telegram/live-message.js";
@@ -927,33 +931,20 @@ export class Bridge {
       return { toast: "could not create topic" };
     }
 
-    // Build a transcript draft; the AgentSession routes suppressed replay chunks
-    // to onReplayChunk during session/load, and we append them with role
-    // separators. MessageDraft owns HTML conversion, rollover and throttling.
-    const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
-      intervalMs: this.#cfg.editIntervalMs,
-      maxLen: RICH_MAX_LEN,
-      render: mdToRichHtml,
-    });
-    let lastRole: "user" | "agent" | undefined;
+    // Collect the suppressed replay into speaker TURNS (consecutive same-role
+    // chunks merge). AgentSession routes every replay chunk to onReplayChunk
+    // during session/load, all before #spawnTopic resolves — so the whole
+    // history is in `turns` by the time the transcript is posted below.
+    const turns: Array<{ role: "user" | "agent"; text: string }> = [];
     const onReplayChunk = (u: acp.SessionUpdate): void => {
       let role: "user" | "agent";
-      let text: string | undefined;
-      if (u.sessionUpdate === "user_message_chunk") {
-        role = "user";
-        if (u.content.type === "text") text = u.content.text;
-      } else if (u.sessionUpdate === "agent_message_chunk") {
-        role = "agent";
-        if (u.content.type === "text") text = u.content.text;
-      } else {
-        return;
-      }
-      if (text === undefined) return;
-      if (role !== lastRole) {
-        draft.append(role === "user" ? "\n👤 **You:**\n" : "\n🤖\n");
-        lastRole = role;
-      }
-      draft.append(text);
+      if (u.sessionUpdate === "user_message_chunk") role = "user";
+      else if (u.sessionUpdate === "agent_message_chunk") role = "agent";
+      else return;
+      if (u.content.type !== "text") return;
+      const last = turns[turns.length - 1];
+      if (last && last.role === role) last.text += u.content.text;
+      else turns.push({ role, text: u.content.text });
     };
 
     let session: TopicSession;
@@ -961,12 +952,24 @@ export class Bridge {
       session = await this.#spawnTopic(threadId, target.cwd, target.sessionId, onReplayChunk);
     } catch (e) {
       logError("attach spawn failed", e);
-      await draft.finalize().catch(() => {});
       await this.#send(threadId, "💥 could not attach the session — /new to start fresh.");
       return { toast: "attach failed" };
     }
 
-    await draft.finalize();
+    // Post the transcript ONE MESSAGE PER TURN — far more readable than one
+    // rolled-over blob. User turns render as literal bold blockquotes, agent
+    // turns as markdown under a 🤖 header; MessageDraft still owns rollover
+    // for any single turn that exceeds the rich budget.
+    for (const turn of turns) {
+      if (turn.text.trim() === "") continue;
+      const draft = new MessageDraft(this.#makeUi(threadId).messageApi(), {
+        intervalMs: this.#cfg.editIntervalMs,
+        maxLen: RICH_MAX_LEN,
+        render: turn.role === "user" ? renderUserTurnRich : renderAgentTurnRich,
+      });
+      draft.append(turn.text);
+      await draft.finalize();
+    }
 
     const agent = session.agentSession;
     await this.#store.upsert({

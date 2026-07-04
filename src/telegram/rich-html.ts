@@ -281,6 +281,23 @@ export function richDetails(summary: string, bodyHtml: string, open = true): str
 }
 
 /**
+ * Render one USER turn of a replayed transcript: a bold blockquote headed
+ * `👤 You`. The text is shown LITERALLY (escaped, no markdown interpretation —
+ * users don't style their messages, and any styling chars that do appear show
+ * exactly as typed), which makes restored user messages visually unmistakable
+ * next to the agent's rendered markdown.
+ */
+export function renderUserTurnRich(text: string): string {
+  const body = escapeRich(text).replace(/\n/g, "<br/>");
+  return `<blockquote><b>👤 You<br/>${body}</b></blockquote>`;
+}
+
+/** Render one AGENT turn of a replayed transcript: a 🤖 header, then rendered markdown. */
+export function renderAgentTurnRich(md: string): string {
+  return `<p>🤖</p>\n${mdToRichHtml(md)}`;
+}
+
+/**
  * Render a live status panel as `<details><summary>…</summary><ul>…rows…</ul></details>`,
  * keeping the whole payload within `max`. Rows are the panel body (each a
  * self-contained `<li>…</li>`); when they overflow the budget the OLDEST rows

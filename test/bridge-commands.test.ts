@@ -611,6 +611,10 @@ describe("Bridge", () => {
     const REPLAY: import("@agentclientprotocol/sdk").SessionUpdate[] = [
       { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old question" } },
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old answer" } },
+      // Same-role chunk: merges into the SAME agent message, not a new one.
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " continued" } },
+      // User styling chars must render literally, not as markdown.
+      { sessionUpdate: "user_message_chunk", content: { type: "text", text: "**styled** follow-up" } },
     ];
 
     it("filters out already-attached ids from the listing", async () => {
@@ -661,18 +665,26 @@ describe("Bridge", () => {
       // Topic title = session title truncated (present) → "Resume me please".
       expect(botApi.topics.at(-1)!.name).toBe("Resume me please");
 
-      // The transcript streams via a MessageDraft, whose final content lands in
-      // an editMessageText (sends carry only the leading-edge partial). Gather
-      // sends into this thread + all edits; the fully-rendered transcript is one
-      // html string containing both roles in order.
+      // The transcript posts ONE MESSAGE PER SPEAKER TURN: user turns as
+      // literal bold blockquotes, agent turns as markdown under a 🤖 header.
       const sendHtml = botApi.messages
         .filter((m) => m.threadId === attachedThread)
         .map((m) => m.html);
-      const allHtml = [...sendHtml, ...botApi.edits.map((e) => e.html)];
-      const full = allHtml.find((h) => h.includes("old question") && h.includes("old answer"))!;
-      expect(full).toBeDefined();
-      expect(full).toContain("👤"); // user separator
-      expect(full.indexOf("old question")).toBeLessThan(full.indexOf("old answer"));
+      const userMsg = sendHtml.find((h) => h.includes("old question"))!;
+      const agentMsg = sendHtml.find((h) => h.includes("old answer"))!;
+      expect(userMsg).toBeDefined();
+      expect(agentMsg).toBeDefined();
+      expect(userMsg).not.toBe(agentMsg); // separate messages per turn
+      expect(userMsg).toContain("<blockquote><b>👤 You");
+      expect(agentMsg).toContain("🤖");
+      // Turns arrive in conversation order.
+      expect(sendHtml.indexOf(userMsg)).toBeLessThan(sendHtml.indexOf(agentMsg));
+      // Same-role chunks merged into one message.
+      expect(agentMsg).toContain("old answer continued");
+      // User styling chars stay literal — never rendered as markdown.
+      const followUp = sendHtml.find((h) => h.includes("styled"))!;
+      expect(followUp).toContain("**styled** follow-up");
+      expect(followUp).not.toContain("<b>styled</b>");
       // The attached notice was sent into the thread.
       expect(sendHtml.join("\n")).toContain("attached");
 

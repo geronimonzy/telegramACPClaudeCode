@@ -164,7 +164,7 @@ regardless of the working directory chosen.
 | Command | Description |
 |---|---|
 | `/new [folder] [name…]` | Start a new session topic. The first word picks the working directory: an absolute or `~` path (must exist), a key in `projects`, or a directory under `defaultCwd`. Everything after it becomes the topic title (e.g. `/new receiptSaas Design Requirements`); with no title the topic gets a random three-word name. With no arguments at all: `defaultCwd` + random name. |
-| `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic, replays the session's **full** history as a readable transcript, and goes live. Works from General or any topic. |
+| `/sessions` | List the agent's resumable sessions (most recent ~10, excluding ones already attached) with a tap-to-attach button each. Attaching creates a new topic and replays the session's **full** history — one message per speaker turn (your messages as bold `👤 You` quotes, the agent's as rendered markdown under 🤖) — then goes live. Works from General or any topic. |
 | `/end` | End this session and close the topic. |
 | `/cancel` | Cancel the in-flight turn. |
 | `/mode` | Choose the agent mode (inline keyboard of modes the agent advertises). |
