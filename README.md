@@ -17,12 +17,15 @@ install.
 
 You talk to the bot in a Telegram group. `/new` opens a forum topic and starts
 a Claude Code ACP session with a chosen working directory. Plain text you
-send in that topic becomes a prompt; the reply streams back as a live-edited
-message. Photos and documents you send are attached to your *next* prompt.
-Claude Code's own tool-call activity, plans, and permission requests render
-as Telegram messages with inline buttons. Session state (which topic maps to
-which ACP session id and cwd) is persisted to disk so a bot restart
-reattaches every open topic.
+send in that topic becomes a prompt; the reply streams back as live-edited
+**Rich Messages** (native tables, lists, code blocks), interleaved
+chronologically with collapsible ⚙️ Activity panels for tool calls — the way
+the Claude Code CLI renders a turn. Photos and documents you send are
+attached to your *next* prompt. Plans and permission requests render as
+messages with inline buttons. Session state (which topic maps to which ACP
+session id and cwd) is persisted to disk; after a bridge restart each topic
+gets a **🔌 Reconnect** button (sessions are never auto-reattached), and a
+successful reconnect offers a one-tap 🧠 Compact / ▶️ Continue choice.
 
 ## Setup
 
@@ -155,11 +158,8 @@ touches an existing `config.json`.
 
 ## Command reference
 
-Commands run inside a session topic unless noted. `/new` and `/sessions` also
-work from General or any topic (they always create a *new* topic).
-
-Topic titles are always a random three-word name (e.g. `amber-falcon-tide`),
-regardless of the working directory chosen.
+Commands run inside a session topic unless noted. `/new`, `/sessions` and
+`/usage` also work from General or any topic.
 
 | Command | Description |
 |---|---|
@@ -170,6 +170,8 @@ regardless of the working directory chosen.
 | `/end` | End this session and close the topic. |
 | `/cancel` | Cancel the in-flight turn. |
 | `/mode` | Choose the agent mode (inline keyboard of modes the agent advertises). |
+| `/model` | Choose the model for this session (inline keyboard of what the adapter advertises: default/sonnet/opus/haiku/…; current value ✅-marked). |
+| `/effort` | Choose the reasoning effort for this session (default/low/medium/high/xhigh/max; current value ✅-marked). |
 | `/yolo` | Toggle bypass-permissions mode on/off for this session. |
 | `/status` | Show session status: session id, cwd, mode, and token/cost usage if available. |
 | `/commands` | List the commands *this agent* (Claude Code) advertises beyond the bridge's own. |
@@ -183,9 +185,24 @@ known; otherwise the bridge replies that it's unknown. Plain text (no leading
 send next in that topic (a photo/document with no accompanying text is held
 until you do).
 
-General topic behavior: messages sent outside any topic only accept `/new`
-and `/sessions`; anything else gets a short reminder to use `/new` or to talk
-inside a session topic.
+General topic behavior: messages sent outside any topic only accept `/new`,
+`/sessions` and `/usage`; anything else gets a short reminder to use `/new`
+or to talk inside a session topic.
+
+Housekeeping the bridge does on its own:
+
+- **Deleted topics reconcile automatically.** Telegram sends bots no event
+  when a topic is deleted, so the bridge notices the first time a
+  thread-scoped call fails (and `/sessions` actively probes every stored
+  topic first): the dead topic's session is released and reappears as
+  attachable in `/sessions`.
+- **Bridge sessions are visible in the CLI's `/resume`.** The adapter is
+  spawned with `CLAUDE_CODE_ENTRYPOINT=telegram-acp-bridge`, which keeps its
+  sessions out of the CLI's hidden-entrypoint set (plain SDK sessions are
+  filtered from the resume picker). Sessions created before this behavior
+  existed remain hidden.
+- **The 📊 Claude Usage panel refreshes hourly** (edit-only — deleting the
+  topic disables the refresh until the next manual `/usage`).
 
 ## Troubleshooting
 
