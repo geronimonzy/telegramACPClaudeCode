@@ -100,6 +100,23 @@ describe("mdToRichHtml — block types", () => {
     expect(isBalanced(out)).toBe(true);
   });
 
+  // Regression: a `# heading` line inside a blockquote used to render the
+  // literal `#` characters (BLOCKQUOTE_RE's content was never checked against
+  // HEADING_RE). Rich HTML can't nest <h1>-<h6> inside <blockquote>, so the
+  // minimal fix renders it bold instead.
+  it("heading line inside a blockquote renders bold, not a literal #", () => {
+    const out = mdToRichHtml("> # Title");
+    expect(out).toBe("<blockquote><b>Title</b></blockquote>");
+    expect(out).not.toContain("#");
+    expect(isBalanced(out)).toBe(true);
+  });
+
+  it("heading line mixed with plain lines inside a blockquote", () => {
+    const out = mdToRichHtml("> intro\n> ## Section\n> more");
+    expect(out).toBe("<blockquote>intro<br/><b>Section</b><br/>more</blockquote>");
+    expect(isBalanced(out)).toBe(true);
+  });
+
   it("bulleted list → <ul><li>", () => {
     const out = mdToRichHtml("- one\n- two\n- three");
     expect(out).toBe("<ul><li>one</li><li>two</li><li>three</li></ul>");
