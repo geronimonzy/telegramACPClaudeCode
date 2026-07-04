@@ -13,6 +13,14 @@ export interface SessionState {
    * (CLI-mirroring cursor). Absent until the first mirror poll baselines it.
    */
   mirrorOffset?: number;
+  /**
+   * The Telegram message id of the currently-live reconnect-offer notice in
+   * this topic (the "🔌 … Tap Reconnect to resume." message). Absent when no
+   * such notice is outstanding. Tracked so at most one ever accumulates per
+   * topic across bridge restarts, and so it can be deleted once the user
+   * actually reconnects.
+   */
+  reconnectMsgId?: number;
 }
 
 export class StateStore {

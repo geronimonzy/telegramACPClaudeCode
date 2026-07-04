@@ -372,10 +372,9 @@ export class Bridge {
     const stored = this.#store.list();
     this.#seq = stored.length;
     for (const s of stored) {
-      await this.#send(
-        s.threadId,
+      await this.#offerReconnect(
+        s,
         `🔌 <b>${escapeHtml(s.title)}</b> — disconnected (bridge restarted). Tap Reconnect to resume.`,
-        this.#reconnectKeyboard(s.threadId),
       );
     }
     await this.#botApi.setMyCommands(COMMAND_LIST).catch((e) => logError("setMyCommands", e));
@@ -570,12 +569,9 @@ export class Bridge {
       // persisted state — steer the user to Reconnect rather than /new, which
       // would abandon the session. A topic with no stored state gets the plain
       // "start one" notice.
-      if (this.#store.get(threadId)) {
-        await this.#send(
-          threadId,
-          "🔌 This session is disconnected. Tap Reconnect to resume.",
-          this.#reconnectKeyboard(threadId),
-        );
+      const stored = this.#store.get(threadId);
+      if (stored) {
+        await this.#offerReconnect(stored, "🔌 This session is disconnected. Tap Reconnect to resume.");
       } else {
         await this.#send(threadId, NO_SESSION);
       }
@@ -962,6 +958,15 @@ export class Bridge {
       const session = await this.#spawnTopic(threadId, stored.cwd, stored.acpSessionId);
       const agent = session.agentSession;
       if (agent.loaded) {
+        // The reconnect-offer notice (if any) is now stale — clear it, and
+        // drop the field from the store since nothing is tracking it anymore.
+        if (stored.reconnectMsgId !== undefined) {
+          await this.#botApi
+            .deleteMessage(stored.reconnectMsgId)
+            .catch((e) => logError("reconnect notice delete failed", e));
+          const { reconnectMsgId: _reconnectMsgId, ...rest } = stored;
+          await this.#store.upsert(rest);
+        }
         // Mirror the Claude Code TUI's resume choice: a restored session may
         // carry a large context, so offer a one-tap /compact alongside plain
         // continue. (Over ACP there is no such prompt from the agent itself —
@@ -977,8 +982,16 @@ export class Bridge {
         this.#pokeProjects(); // session moved disconnected → running
         return { toast: "reconnected" };
       }
-      // loadSession failed; AgentSession fell back to a fresh session.
-      await this.#store.upsert({ ...stored, acpSessionId: agent.sessionId });
+      // loadSession failed; AgentSession fell back to a fresh session. The
+      // reconnect-offer notice (if any) is stale too — clear it, folding the
+      // field's omission into the upsert this branch already needs.
+      if (stored.reconnectMsgId !== undefined) {
+        await this.#botApi
+          .deleteMessage(stored.reconnectMsgId)
+          .catch((e) => logError("reconnect notice delete failed", e));
+      }
+      const { reconnectMsgId: _reconnectMsgId, ...rest } = stored;
+      await this.#store.upsert({ ...rest, acpSessionId: agent.sessionId });
       await this.#send(
         threadId,
         `⚠️ <b>${escapeHtml(stored.title)}</b> — previous session could not be restored; started fresh.`,
@@ -987,10 +1000,9 @@ export class Bridge {
       return { toast: "started fresh" };
     } catch (e) {
       logError(`reconnect failed for thread ${threadId}`, e);
-      await this.#send(
-        threadId,
+      await this.#offerReconnect(
+        stored,
         `💥 <b>${escapeHtml(stored.title)}</b> — could not reconnect. Tap Reconnect to retry.`,
-        this.#reconnectKeyboard(threadId),
       );
       return { toast: "reconnect failed" };
     }
@@ -1961,6 +1973,38 @@ export class Bridge {
         await botApi.editMessageText(messageId, html);
       },
     };
+  }
+
+  /**
+   * Post (or replace) the reconnect-offer notice for a stored-but-disconnected
+   * topic. Owns the invariant that AT MOST ONE such notice is ever live in a
+   * topic: every bridge restart used to send a fresh one, so topics piled up
+   * duplicates. If a previous notice is tracked, it is best-effort deleted
+   * first (a >48h-old message can't be deleted; that's fine, just log). Needs
+   * the sent message id, so it cannot go through `#send` (which returns void)
+   * — sends directly and replicates `#send`'s deleted-topic handling.
+   */
+  async #offerReconnect(s: SessionState, html: string): Promise<void> {
+    if (s.reconnectMsgId !== undefined) {
+      await this.#botApi
+        .deleteMessage(s.reconnectMsgId)
+        .catch((e) => logError("reconnect notice delete failed", e));
+    }
+    let newId: number;
+    try {
+      newId = await this.#botApi.sendMessage(s.threadId, html, this.#reconnectKeyboard(s.threadId));
+    } catch (e) {
+      if (isThreadNotFound(e)) {
+        await this.#pruneDeletedTopic(s.threadId);
+        return;
+      }
+      logError("offerReconnect send failed", e);
+      return;
+    }
+    // Re-read the entry: a concurrent upsert may have changed other fields
+    // while we were sending (see #mirrorOne for this exact pattern).
+    const cur = this.#store.get(s.threadId);
+    if (cur) await this.#store.upsert({ ...cur, reconnectMsgId: newId });
   }
 
   async #send(threadId: number | undefined, html: string, keyboard?: InlineKeyboard): Promise<void> {

@@ -572,6 +572,138 @@ describe("Bridge", () => {
     expect(prompt!.keyboard!.inline_keyboard[0]![0]!.callback_data).toBe("reconnect:888");
   });
 
+  it("two consecutive bridge restarts leave only one reconnect notice, tracked in the store", async () => {
+    // Regression: init() used to send a fresh disconnect notice on EVERY
+    // restart with no memory of the last one, so topics accumulated
+    // duplicates. Two fresh Bridge instances over the SAME store file/dir
+    // simulate a real restart (process exits, a new one loads the same state).
+    const botApi = new FakeBotApi();
+    const storeFile = join(dir, "state.json");
+    const stored: SessionState = {
+      threadId: 555,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "restored-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(storeFile, JSON.stringify([stored]));
+
+    const cfg = makeConfig();
+    const store1 = new StateStore(storeFile);
+    const bridge1 = new Bridge(cfg, botApi, store1);
+    await bridge1.init();
+
+    const firstNotice = botApi.messages.find(
+      (m) => m.threadId === 555 && /disconnected/i.test(m.html),
+    )!;
+    expect(firstNotice).toBeDefined();
+    expect(botApi.deletions).toHaveLength(0);
+    expect(store1.get(555)?.reconnectMsgId).toBe(firstNotice.messageId);
+
+    const store2 = new StateStore(storeFile);
+    const bridge2 = new Bridge(cfg, botApi, store2);
+    await bridge2.init();
+
+    expect(botApi.deletions).toEqual([firstNotice.messageId]);
+    const secondNotice = botApi.messages.find(
+      (m) => m.threadId === 555 && /disconnected/i.test(m.html),
+    )!;
+    expect(secondNotice).toBeDefined();
+    expect(secondNotice.messageId).not.toBe(firstNotice.messageId);
+    expect(store2.get(555)?.reconnectMsgId).toBe(secondNotice.messageId);
+  });
+
+  it("a successful reconnect tap deletes the tracked reconnect notice and clears it from the store", async () => {
+    const { bridge, botApi, store } = makeBridge();
+    const stored: SessionState = {
+      threadId: 555,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "restored-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+    await bridge.init();
+
+    const notice = botApi.messages.find((m) => m.threadId === 555 && /disconnected/i.test(m.html))!;
+    expect(store.get(555)?.reconnectMsgId).toBe(notice.messageId);
+
+    const res = await bridge.handleCallback("reconnect:555", undefined);
+    expect(res?.toast).toBe("reconnected");
+
+    expect(botApi.deletions).toContain(notice.messageId);
+    expect(store.get(555)?.reconnectMsgId).toBeUndefined();
+  });
+
+  it("messaging a disconnected topic twice replaces the reconnect notice, not duplicates it", async () => {
+    const { bridge, botApi, store } = makeBridge();
+    const stored: SessionState = {
+      threadId: 888,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "sleeping-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, "state.json"), JSON.stringify([stored]));
+    await bridge.init();
+    const bootNotice = botApi.messages.find(
+      (m) => m.threadId === 888 && /disconnected/i.test(m.html),
+    )!;
+
+    await bridge.handleMessage(888, { text: "hello?" });
+    const firstMsgNotice = botApi.messages.find(
+      (m) => m.threadId === 888 && /disconnected/i.test(m.html) && m.messageId !== bootNotice.messageId,
+    )!;
+    expect(botApi.deletions).toContain(bootNotice.messageId);
+    expect(store.get(888)?.reconnectMsgId).toBe(firstMsgNotice.messageId);
+
+    await bridge.handleMessage(888, { text: "hello again?" });
+    const secondMsgNotice = botApi.messages.find(
+      (m) =>
+        m.threadId === 888 &&
+        /disconnected/i.test(m.html) &&
+        m.messageId !== firstMsgNotice.messageId &&
+        m.messageId !== bootNotice.messageId,
+    )!;
+    expect(botApi.deletions).toContain(firstMsgNotice.messageId);
+    expect(store.get(888)?.reconnectMsgId).toBe(secondMsgNotice.messageId);
+  });
+
+  it("reconnect-failed re-offer replaces the tracked reconnect notice", async () => {
+    const cfg = makeConfig();
+    const botApi = new FakeBotApi();
+    const storeFile = join(dir, "state.json");
+    const stored: SessionState = {
+      threadId: 555,
+      acpSessionId: "sess_mock_1",
+      cwd: dir,
+      title: "restored-one",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(storeFile, JSON.stringify([stored]));
+    const store = new StateStore(storeFile);
+    const starter: AgentStarter = async () => {
+      throw new Error("spawn boom");
+    };
+    const bridge = new Bridge(cfg, botApi, store, starter);
+    await bridge.init();
+
+    const bootNotice = botApi.messages.find(
+      (m) => m.threadId === 555 && /disconnected/i.test(m.html),
+    )!;
+    expect(store.get(555)?.reconnectMsgId).toBe(bootNotice.messageId);
+
+    const res = await bridge.handleCallback("reconnect:555", undefined);
+    expect(res?.toast).toBe("reconnect failed");
+
+    expect(botApi.deletions).toContain(bootNotice.messageId);
+    const retryNotice = botApi.messages.find(
+      (m) => m.threadId === 555 && /could not reconnect/i.test(m.html),
+    )!;
+    expect(retryNotice.messageId).not.toBe(bootNotice.messageId);
+    expect(store.get(555)?.reconnectMsgId).toBe(retryNotice.messageId);
+  });
+
   describe("CLI mirror", () => {
     const cliUser = (text: string): string =>
       JSON.stringify({ type: "user", entrypoint: "cli", message: { role: "user", content: text } }) + "\n";
