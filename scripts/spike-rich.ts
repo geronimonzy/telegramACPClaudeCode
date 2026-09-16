@@ -11,10 +11,14 @@
 // will receive `spike:noop` as an unrecognized callback_data and answer it
 // harmlessly. That's expected, not a bug.
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Bot, GrammyError } from "grammy";
 import { loadConfig } from "../src/config.js";
 
-const CONFIG_PATH = "/home/kiril/.config/telegram-acp-bridge/config.json";
+// Same resolution as src/index.ts: optional argv[2], else the default location.
+const CONFIG_PATH =
+  process.argv[2] ?? join(homedir(), ".config", "telegram-acp-bridge", "config.json");
 
 function describeError(err: unknown): string {
   if (err instanceof GrammyError) {

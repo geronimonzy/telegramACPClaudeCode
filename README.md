@@ -13,6 +13,14 @@ credentials `claude login` already set up on the host. It does not implement
 its own model access or billing — it drives your existing Claude Code
 install.
 
+<p align="center">
+  <img src="docs/images/session-activity.jpg" width="200" alt="A session topic: the prompt quoted as 👤 You, the agent's streamed markdown reply, and collapsible ⚙️ Activity panels listing each tool call">
+  <img src="docs/images/general-reconnect.jpg" width="200" alt="The General topic after a bridge restart: one 🔌 Reconnect notice per session topic, each with a Reconnect button">
+  <img src="docs/images/usage-panel.jpg" width="200" alt="The pinned 📊 Claude Usage panel: per-model token tables for today and the last 7 days, plus a list of live sessions">
+  <img src="docs/images/cli-mirroring.jpg" width="200" alt="CLI mirroring: a session picked up in the terminal via /resume, with its turns relayed into the Telegram topic under a 💻 picked up outside Telegram notice">
+</p>
+<p align="center"><sub>Left to right: a session topic with ⚙️ Activity panels · 🔌 Reconnect notices in General after a restart · the 📊 Claude Usage panel · a session mirrored from the CLI</sub></p>
+
 ## How it works, in one paragraph
 
 You talk to the bot in a Telegram group. `/new` opens a forum topic and starts
